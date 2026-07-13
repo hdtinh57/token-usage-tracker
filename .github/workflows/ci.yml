@@ -21,5 +21,8 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Run linter
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build release binary
         run: cargo build --release --verbose

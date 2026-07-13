@@ -2,7 +2,9 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::NaiveDate;
 
-use crate::history::{History, RawTotals};
+use crate::history::History;
+#[cfg(test)]
+use crate::history::RawTotals;
 use crate::pricing::PricingTable;
 use crate::quota::ClaudeQuota;
 
@@ -280,6 +282,7 @@ pub fn hourly_totals_for(
     acc
 }
 
+#[cfg(test)]
 pub fn history_totals_for(
     stats: &Stats,
     start: NaiveDate,
@@ -290,15 +293,19 @@ pub fn history_totals_for(
     stats.history.totals_in(start..=end, model, source)
 }
 
+#[cfg(test)]
 pub fn weekly_totals_for(
     stats: &Stats,
     pricing: &PricingTable,
     model: Option<&str>,
     source: Option<Source>,
 ) -> Totals {
-    let mut totals = stats
-        .history
-        .current_week_totals(stats.current_day, pricing, model, source);
+    let mut totals = stats.history.priced_totals_in(
+        (stats.current_day - chrono::Duration::days(6))..=stats.current_day,
+        pricing,
+        model,
+        source,
+    );
     for ((entry_source, entry_model), current) in &stats.by_model {
         if model.is_some_and(|filter| entry_model != filter)
             || source.is_some_and(|filter| *entry_source != filter)

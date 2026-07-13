@@ -4,7 +4,7 @@ use std::io::{self, BufReader, BufWriter, Write};
 use std::ops::RangeInclusive;
 use std::path::Path;
 
-use chrono::{Duration, NaiveDate};
+use chrono::NaiveDate;
 use serde::{Deserialize, Serialize};
 
 use crate::model::{Source, Totals};
@@ -121,6 +121,7 @@ impl History {
         self.days.contains_key(&day)
     }
 
+    #[cfg(test)]
     pub fn totals_for(
         &self,
         day: NaiveDate,
@@ -130,6 +131,7 @@ impl History {
         self.totals_in(day..=day, model, source)
     }
 
+    #[cfg(test)]
     pub fn totals_in(
         &self,
         days: RangeInclusive<NaiveDate>,
@@ -147,17 +149,6 @@ impl History {
             }
         }
         result
-    }
-
-    pub fn current_week_totals(
-        &self,
-        today: NaiveDate,
-        pricing: &PricingTable,
-        model: Option<&str>,
-        source: Option<Source>,
-    ) -> Totals {
-        let start = today - Duration::days(6);
-        self.priced_totals_in(start..=today, pricing, model, source)
     }
 
     pub fn priced_totals_in(

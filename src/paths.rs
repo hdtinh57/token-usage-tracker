@@ -5,7 +5,6 @@ use std::path::PathBuf;
 const DEFAULT_PRICING_JSON: &str = include_str!("../pricing_default.json");
 
 pub struct Paths {
-    pub root: PathBuf,
     pub pricing: PathBuf,
     pub settings: PathBuf,
     pub history: PathBuf,
@@ -44,7 +43,6 @@ impl Paths {
         Ok(Self {
             settings: root.join("settings.json"),
             history: root.join("history.json"),
-            root,
             pricing,
         })
     }
@@ -65,10 +63,10 @@ mod tests {
         ));
         let paths = Paths::from_app_data(root.clone()).unwrap();
 
-        assert_eq!(paths.root, root.join("TokenTracker"));
-        assert_eq!(paths.pricing, paths.root.join("pricing.json"));
-        assert_eq!(paths.settings, paths.root.join("settings.json"));
-        assert_eq!(paths.history, paths.root.join("history.json"));
+        let app_root = root.join("TokenTracker");
+        assert_eq!(paths.pricing, app_root.join("pricing.json"));
+        assert_eq!(paths.settings, app_root.join("settings.json"));
+        assert_eq!(paths.history, app_root.join("history.json"));
         assert!(paths.pricing.exists());
 
         let _ = std::fs::remove_dir_all(root);

@@ -1,3 +1,5 @@
 /target
 *.stackdump
 /docs
+.superpowers/
+*.tmp
