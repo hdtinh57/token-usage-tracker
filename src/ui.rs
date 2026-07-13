@@ -507,34 +507,41 @@ impl App {
                 activity_feed(ui, stats, ui.available_height());
             }
             View::History => {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    heading(ui, "RECENT DAYS");
-                    for offset in 1..=14 {
-                        let day = stats.current_day - chrono::Duration::days(offset);
-                        let totals = historical_totals(stats, pricing.as_ref(), day, day);
-                        if totals.total_tokens() > 0 {
-                            totals_row(ui, &day.format("%a %d %b").to_string(), &totals);
+                egui::ScrollArea::vertical()
+                    .max_height(history_scroll_height(ui.available_height()))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        heading(ui, "RECENT DAYS");
+                        for offset in 1..=14 {
+                            let day = stats.current_day - chrono::Duration::days(offset);
+                            let totals = historical_totals(stats, pricing.as_ref(), day, day);
+                            if totals.total_tokens() > 0 {
+                                totals_row(ui, &day.format("%a %d %b").to_string(), &totals);
+                            }
                         }
-                    }
-                    divider(ui);
-                    heading(ui, "WEEKLY TOTALS");
-                    for week in 1..=4 {
-                        let end = stats.current_day - chrono::Duration::days((week * 7) as i64);
-                        let start = end - chrono::Duration::days(6);
-                        let totals = historical_totals(stats, pricing.as_ref(), start, end);
-                        if totals.total_tokens() > 0 {
-                            totals_row(
-                                ui,
-                                &format!("{}–{}", start.format("%d %b"), end.format("%d %b")),
-                                &totals,
-                            );
+                        divider(ui);
+                        heading(ui, "WEEKLY TOTALS");
+                        for week in 1..=4 {
+                            let end = stats.current_day - chrono::Duration::days((week * 7) as i64);
+                            let start = end - chrono::Duration::days(6);
+                            let totals = historical_totals(stats, pricing.as_ref(), start, end);
+                            if totals.total_tokens() > 0 {
+                                totals_row(
+                                    ui,
+                                    &format!("{}–{}", start.format("%d %b"), end.format("%d %b")),
+                                    &totals,
+                                );
+                            }
                         }
-                    }
-                });
+                    });
             }
             View::Today => unreachable!(),
         }
     }
+}
+
+fn history_scroll_height(available: f32) -> f32 {
+    available.max(0.0)
 }
 
 fn historical_totals(
@@ -667,6 +674,12 @@ mod tests {
         assert_eq!(View::Today.next(), View::Week);
         assert_eq!(View::Week.next(), View::History);
         assert_eq!(View::History.next(), View::Today);
+    }
+
+    #[test]
+    fn history_scroll_height_never_goes_negative() {
+        assert_eq!(history_scroll_height(-1.0), 0.0);
+        assert_eq!(history_scroll_height(120.0), 120.0);
     }
 
     #[test]
