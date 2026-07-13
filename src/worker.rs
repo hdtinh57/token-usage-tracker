@@ -40,7 +40,7 @@ impl Worker {
         pricing_path: PathBuf,
         snapshot: Arc<Mutex<Arc<Stats>>>,
     ) -> std::io::Result<Self> {
-        let pricing = PricingTable::load_or_init(&pricing_path)?;
+        let pricing = PricingTable::load(&pricing_path)?;
         let pricing_mtime = std::fs::metadata(&pricing_path)
             .and_then(|m| m.modified())
             .ok();
@@ -162,7 +162,7 @@ impl Worker {
             .and_then(|m| m.modified())
             .ok();
         if mtime != self.pricing_mtime
-            && let Ok(pricing) = PricingTable::load_or_init(&self.pricing_path)
+            && let Ok(pricing) = PricingTable::load(&self.pricing_path)
         {
             self.pricing = pricing;
             self.pricing_mtime = mtime;
@@ -223,7 +223,9 @@ mod tests {
     fn startup_rescan_ingests_todays_events_from_both_roots() {
         let claude_root = temp_root("claude");
         let codex_root = temp_root("codex");
-        let pricing_path = temp_root("pricing_dir").join("pricing.json");
+        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir"))
+            .unwrap()
+            .pricing;
         let claude_line = format!(
             r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#,
             today_ts(9)
@@ -263,7 +265,9 @@ mod tests {
     fn fast_tick_picks_up_appended_lines_after_startup() {
         let claude_root = temp_root("claude2");
         let codex_root = temp_root("codex2");
-        let pricing_path = temp_root("pricing_dir2").join("pricing.json");
+        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir2"))
+            .unwrap()
+            .pricing;
         std::fs::write(claude_root.join("session1.jsonl"), b"").unwrap();
         let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
             chrono::Local::now().date_naive(),
@@ -300,7 +304,9 @@ mod tests {
     fn slow_tick_discovers_a_brand_new_file_created_after_startup() {
         let claude_root = temp_root("claude3");
         let codex_root = temp_root("codex3");
-        let pricing_path = temp_root("pricing_dir3").join("pricing.json");
+        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir3"))
+            .unwrap()
+            .pricing;
         let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
             chrono::Local::now().date_naive(),
         ))));
@@ -323,6 +329,54 @@ mod tests {
             crate::model::totals_for(&snapshot.lock().unwrap().clone(), None, None).input,
             3
         );
+        let _ = std::fs::remove_dir_all(claude_root);
+        let _ = std::fs::remove_dir_all(codex_root);
+    }
+
+    #[test]
+    fn malformed_pricing_keeps_the_last_good_table_and_retries_after_correction() {
+        let claude_root = temp_root("reload_claude");
+        let codex_root = temp_root("reload_codex");
+        let pricing_path = crate::paths::Paths::from_app_data(temp_root("reload_pricing"))
+            .unwrap()
+            .pricing;
+        std::fs::write(
+            &pricing_path,
+            r#"{ "model": { "input": 1.0, "output": 1.0, "cache_read": 1.0, "cache_write": 1.0 } }"#,
+        )
+        .unwrap();
+        let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
+            chrono::Local::now().date_naive(),
+        ))));
+        let mut worker = Worker::new(
+            claude_root.clone(),
+            codex_root.clone(),
+            pricing_path.clone(),
+            snapshot,
+        )
+        .unwrap();
+        let initial_mtime = worker.pricing_mtime;
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&pricing_path, "not json").unwrap();
+        worker.reload_pricing_if_changed();
+        assert_eq!(worker.pricing_mtime, initial_mtime);
+        assert_eq!(worker.pricing.lookup("model").unwrap().input, 1.0);
+
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(
+            &pricing_path,
+            r#"{ "model": { "input": 2.0, "output": 2.0, "cache_read": 2.0, "cache_write": 2.0 } }"#,
+        )
+        .unwrap();
+        let corrected_mtime = std::fs::metadata(&pricing_path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        worker.reload_pricing_if_changed();
+        assert_eq!(worker.pricing_mtime, Some(corrected_mtime));
+        assert_eq!(worker.pricing.lookup("model").unwrap().input, 2.0);
+
         let _ = std::fs::remove_dir_all(claude_root);
         let _ = std::fs::remove_dir_all(codex_root);
     }

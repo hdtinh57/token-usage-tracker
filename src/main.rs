@@ -2,6 +2,7 @@ mod discovery;
 mod model;
 mod parse_claude;
 mod parse_codex;
+mod paths;
 mod pricing;
 mod quota;
 mod tail;
@@ -15,18 +16,12 @@ fn main() -> eframe::Result<()> {
     let home = std::env::var("USERPROFILE").expect("USERPROFILE not set");
     let claude_root = PathBuf::from(&home).join(".claude").join("projects");
     let codex_root = PathBuf::from(&home).join(".codex").join("sessions");
-    let pricing_path = std::env::current_exe()
-        .ok()
-        .and_then(|path| {
-            path.parent()
-                .map(|directory| directory.join("pricing.json"))
-        })
-        .unwrap_or_else(|| PathBuf::from("pricing.json"));
+    let paths = paths::Paths::new().expect("failed to initialize app data directory");
 
     let today = chrono::Local::now().date_naive();
     let snapshot = Arc::new(Mutex::new(Arc::new(model::Stats::new(today))));
 
-    let worker = worker::Worker::new(claude_root, codex_root, pricing_path, snapshot.clone())
+    let worker = worker::Worker::new(claude_root, codex_root, paths.pricing, snapshot.clone())
         .expect("failed to initialize worker (check pricing.json permissions)");
     std::thread::spawn(move || worker.run());
 
