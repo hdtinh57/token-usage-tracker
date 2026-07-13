@@ -70,7 +70,7 @@ mod tests {
     #[test]
     fn longest_prefix_match_survives_minor_version_bumps() {
         let table = sample_table();
-        assert!(table.lookup("claude-sonnet-5").is_some());
+        assert!(table.lookup("claude-sonnet-4-6").is_some());
         assert!(table.lookup("claude-sonnet-4-7").is_some());
         assert!(table.lookup("gpt-5.5").is_some());
         assert!(table.lookup("gpt-5.6").is_some());
@@ -106,7 +106,7 @@ mod tests {
 
         let table = PricingTable::load_or_init(&path).unwrap();
         assert!(path.exists());
-        assert!(table.lookup("claude-sonnet-4-6").is_some());
+        assert!(table.lookup("claude-sonnet-5").is_some());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
