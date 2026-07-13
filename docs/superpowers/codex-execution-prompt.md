@@ -1,6 +1,6 @@
 Execute the implementation plan at `docs/superpowers/plans/2026-07-13-token-usage-tracker.md` in this repo (`C:\Users\huynh\token-tracker`, GitHub remote `origin` = hdtinh57/token-usage-tracker, branch `master`). Read the full plan file first, then the spec it links to (`docs/superpowers/specs/2026-07-13-token-usage-tracker-design.md`) for background — the plan is self-contained (exact file paths, full code, full test code, exact commands, expected output for every step) but the spec explains *why* the tricky parts (truncation handling, day-rollover, repricing) work the way they do, in case you need to resolve an ambiguity the plan doesn't cover.
 
-Run each of the 10 tasks in order, one subagent per task, model `gpt-5.6-terra`. Do not start task N+1 until task N's subagent reports its commit made and `cargo test` passed. Give each subagent only its own task's section from the plan (Files/Interfaces/Steps) plus this shared context:
+Run each of the 10 tasks in order, one subagent per task, model `gpt-5.6-luna`. Do not start task N+1 until task N's subagent reports its commit made and `cargo test` passed. Give each subagent only its own task's section from the plan (Files/Interfaces/Steps) plus this shared context:
 
 - Global Constraints section from the top of the plan (dependency limits, no DB/service/file-watch-crate, timestamp/timezone rule, spec file path).
 - The exact interfaces ("Consumes"/"Produces") of any earlier task it depends on, so it knows the real signatures instead of guessing.
