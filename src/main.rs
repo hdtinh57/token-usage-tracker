@@ -8,6 +8,7 @@ mod pricing;
 mod quota;
 mod tail;
 mod ui;
+mod watch;
 mod worker;
 
 use std::path::PathBuf;

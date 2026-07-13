@@ -1,9 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, SystemTime};
 
 use chrono::Local;
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
 use crate::discovery::{collect_mtimes, select_active, walk_jsonl_files};
 use crate::history::RawTotals;
@@ -13,17 +14,21 @@ use crate::parse_codex::CodexSessionParser;
 use crate::pricing::PricingTable;
 use crate::quota;
 use crate::tail::Tailer;
+use crate::watch::PendingPaths;
 
 const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
 const STARTUP_WINDOW: Duration = Duration::from_secs(48 * 60 * 60);
 pub const FAST_TICK: Duration = Duration::from_secs(1);
-pub const SLOW_TICK: Duration = Duration::from_secs(20);
+pub const SLOW_TICK: Duration = Duration::from_secs(10 * 60);
 
 pub struct Worker {
     claude_root: PathBuf,
     codex_root: PathBuf,
     pricing_path: PathBuf,
     history_path: PathBuf,
+    watcher: RecommendedWatcher,
+    watch_events: mpsc::Receiver<notify::Result<notify::Event>>,
+    pending_paths: PendingPaths,
     tailer: Tailer,
     claude_parsers: HashMap<PathBuf, ClaudeSessionParser>,
     codex_parsers: HashMap<PathBuf, CodexSessionParser>,
@@ -50,11 +55,22 @@ impl Worker {
             .ok();
         let mut stats = Stats::new(Local::now().date_naive());
         stats.history = crate::history::History::load(&history_path)?;
-        Ok(Self {
+        let (watch_tx, watch_events) = mpsc::channel();
+        let watcher = RecommendedWatcher::new(
+            move |event| {
+                let _ = watch_tx.send(event);
+            },
+            notify::Config::default(),
+        )
+        .map_err(std::io::Error::other)?;
+        let mut worker = Self {
             claude_root,
             codex_root,
             pricing_path,
             history_path: history_path.clone(),
+            watcher,
+            watch_events,
+            pending_paths: PendingPaths::new(),
             tailer: Tailer::new(),
             claude_parsers: HashMap::new(),
             codex_parsers: HashMap::new(),
@@ -65,7 +81,9 @@ impl Worker {
             startup_history: HashMap::new(),
             last_quota_poll: None,
             snapshot,
-        })
+        };
+        worker.watch_roots();
+        Ok(worker)
     }
 
     fn all_jsonl_files(&self) -> Vec<PathBuf> {
@@ -152,18 +170,44 @@ impl Worker {
 
     pub fn fast_tick(&mut self) {
         self.persist_completed_day_if_needed();
-        for path in self.active_set.clone() {
-            let is_codex = path.starts_with(&self.codex_root);
-            match self.tailer.poll(&path) {
-                Ok(lines) => {
-                    for line in lines {
-                        self.ingest_line(&path, &line, is_codex, false);
+        let mut recover = false;
+        while let Ok(event) = self.watch_events.try_recv() {
+            match event {
+                Ok(event) if matches!(event.kind, EventKind::Create(_) | EventKind::Modify(_)) => {
+                    let now = std::time::Instant::now();
+                    for path in event.paths {
+                        self.pending_paths.push(path, now);
                     }
                 }
-                Err(error) => eprintln!("warning: failed reading {}: {error}", path.display()),
+                Ok(_) => {}
+                Err(error) => {
+                    eprintln!("warning: file watcher error: {error}");
+                    recover = true;
+                }
             }
         }
+        for path in self.pending_paths.take_ready(std::time::Instant::now()) {
+            self.tail_path(&path);
+        }
+        for path in self.active_set.clone() {
+            self.tail_path(&path);
+        }
+        if recover {
+            self.recovery_tick();
+        }
         self.publish();
+    }
+
+    fn tail_path(&mut self, path: &Path) {
+        let is_codex = path.starts_with(&self.codex_root);
+        match self.tailer.poll(path) {
+            Ok(lines) => {
+                for line in lines {
+                    self.ingest_line(path, &line, is_codex, false);
+                }
+            }
+            Err(error) => eprintln!("warning: failed reading {}: {error}", path.display()),
+        }
     }
 
     fn persist_completed_day_if_needed(&mut self) {
@@ -185,10 +229,21 @@ impl Worker {
         self.stats.rollover_if_needed(today);
     }
 
-    pub fn slow_tick(&mut self) {
+    pub fn recovery_tick(&mut self) {
         self.refresh_active_set(ACTIVE_WINDOW);
+        self.watch_roots();
         self.reload_pricing_if_changed();
         self.refresh_claude_quota();
+    }
+
+    fn watch_roots(&mut self) {
+        for root in [&self.claude_root, &self.codex_root] {
+            if root.exists()
+                && let Err(error) = self.watcher.watch(root, RecursiveMode::Recursive)
+            {
+                eprintln!("warning: failed watching {}: {error}", root.display());
+            }
+        }
     }
 
     /// Polls the account for Claude's real quota windows. A failed poll (no
@@ -237,7 +292,7 @@ impl Worker {
             std::thread::sleep(FAST_TICK);
             self.fast_tick();
             if last_slow_tick.elapsed() >= SLOW_TICK {
-                self.slow_tick();
+                self.recovery_tick();
                 last_slow_tick = std::time::Instant::now();
             }
         }
@@ -507,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn slow_tick_discovers_a_brand_new_file_created_after_startup() {
+    fn recovery_tick_discovers_and_ingests_a_brand_new_file_after_startup() {
         let claude_root = temp_root("claude3");
         let codex_root = temp_root("codex3");
         let paths = crate::paths::Paths::from_app_data(temp_root("pricing_dir3")).unwrap();
@@ -530,7 +585,7 @@ mod tests {
             today_ts(12)
         );
         std::fs::write(claude_root.join("brand_new.jsonl"), format!("{}\n", line)).unwrap();
-        worker.slow_tick();
+        worker.recovery_tick();
         worker.fast_tick();
         assert_eq!(
             crate::model::totals_for(&snapshot.lock().unwrap().clone(), None, None).input,
