@@ -32,6 +32,70 @@ impl LineSplitter {
     }
 }
 
+use std::collections::HashMap;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+struct FileTailState {
+    offset: u64,
+    splitter: LineSplitter,
+}
+
+pub struct Tailer {
+    files: HashMap<PathBuf, FileTailState>,
+}
+
+impl Tailer {
+    pub fn new() -> Self {
+        Tailer { files: HashMap::new() }
+    }
+
+    pub fn prime(&mut self, path: &Path, offset: u64) {
+        self.files.insert(
+            path.to_path_buf(),
+            FileTailState { offset, splitter: LineSplitter::new() },
+        );
+    }
+
+    pub fn poll(&mut self, path: &Path) -> std::io::Result<Vec<String>> {
+        let metadata = match std::fs::metadata(path) {
+            Ok(m) => m,
+            Err(_) => {
+                self.files.remove(path);
+                return Ok(Vec::new());
+            }
+        };
+        let current_size = metadata.len();
+        let state = self
+            .files
+            .entry(path.to_path_buf())
+            .or_insert_with(|| FileTailState { offset: 0, splitter: LineSplitter::new() });
+
+        if current_size < state.offset {
+            eprintln!(
+                "warning: {} shrank ({} -> {} bytes); correcting offset in place, not re-parsing",
+                path.display(),
+                state.offset,
+                current_size
+            );
+            state.offset = current_size;
+            state.splitter.reset();
+        }
+
+        if current_size == state.offset {
+            return Ok(Vec::new());
+        }
+
+        let mut file = File::open(path)?;
+        file.seek(SeekFrom::Start(state.offset))?;
+        let mut buf = vec![0u8; (current_size - state.offset) as usize];
+        file.read_exact(&mut buf)?;
+        state.offset = current_size;
+        Ok(state.splitter.feed(&buf))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -84,5 +148,111 @@ mod tests {
         s.reset();
         let lines = s.feed(b"\n");
         assert_eq!(lines, vec!["".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod tailer_tests {
+    use super::*;
+    use std::io::Write;
+    use std::path::PathBuf;
+
+    fn temp_file(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "tt_tailer_test_{}_{}",
+            name,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir.join("log.jsonl")
+    }
+
+    #[test]
+    fn poll_reads_lines_written_since_last_offset_only() {
+        let path = temp_file("basic");
+        std::fs::write(&path, b"line1\nline2\n").unwrap();
+        let mut t = Tailer::new();
+
+        let first = t.poll(&path).unwrap();
+        assert_eq!(first, vec!["line1".to_string(), "line2".to_string()]);
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"line3\n").unwrap();
+        drop(f);
+
+        let second = t.poll(&path).unwrap();
+        assert_eq!(second, vec!["line3".to_string()]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn poll_on_unchanged_file_yields_no_new_lines() {
+        let path = temp_file("unchanged");
+        std::fs::write(&path, b"line1\n").unwrap();
+        let mut t = Tailer::new();
+        t.poll(&path).unwrap();
+        let again = t.poll(&path).unwrap();
+        assert!(again.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn truncation_corrects_offset_in_place_without_duplicating_old_prefix() {
+        let path = temp_file("truncate");
+        std::fs::write(&path, b"aaaaaaaaaa\nbbbbbbbbbb\n").unwrap();
+        let mut t = Tailer::new();
+        let first = t.poll(&path).unwrap();
+        assert_eq!(first.len(), 2);
+
+        // Simulate truncation: rewrite the file much shorter.
+        std::fs::write(&path, b"short\n").unwrap();
+        let after_truncate = t.poll(&path).unwrap();
+        // Must not re-emit the old prefix, and must not error.
+        assert!(after_truncate.is_empty() || after_truncate == vec!["short".to_string()]);
+
+        // Subsequent appends must be picked up normally from the corrected offset.
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"next\n").unwrap();
+        drop(f);
+        let after_append = t.poll(&path).unwrap();
+        assert!(after_append.contains(&"next".to_string()));
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn deleted_file_is_removed_from_tracking_without_error() {
+        let path = temp_file("delete");
+        std::fs::write(&path, b"line1\n").unwrap();
+        let mut t = Tailer::new();
+        t.poll(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let result = t.poll(&path).unwrap();
+        assert!(result.is_empty());
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn prime_sets_offset_to_skip_already_ingested_content() {
+        let path = temp_file("prime");
+        std::fs::write(&path, b"already-read-during-startup-rescan\n").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let mut t = Tailer::new();
+        t.prime(&path, size);
+        let lines = t.poll(&path).unwrap();
+        assert!(lines.is_empty(), "primed offset must skip pre-existing content");
+
+        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        f.write_all(b"new-line\n").unwrap();
+        drop(f);
+        let lines2 = t.poll(&path).unwrap();
+        assert_eq!(lines2, vec!["new-line".to_string()]);
+
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }
