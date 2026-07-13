@@ -22,6 +22,9 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Run linter
+        run: cargo clippy --all-targets -- -D warnings
+
       - name: Build release binary
         run: cargo build --release --verbose
 
@@ -29,7 +32,6 @@ jobs:
         run: |
           mkdir dist
           copy target\release\token-tracker.exe dist\token-tracker.exe
-          copy pricing_default.json dist\pricing_default.json
         shell: cmd
 
       - name: Create GitHub release
@@ -37,5 +39,4 @@ jobs:
         with:
           files: |
             dist/token-tracker.exe
-            dist/pricing_default.json
           generate_release_notes: true

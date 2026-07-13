@@ -1,12 +1,24 @@
 use chrono::Timelike;
 use eframe::egui::{self, Color32, Stroke};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
 
-use crate::model::{Source, Stats, hourly_totals_for, totals_for};
+use crate::model::{Source, Stats, Totals, hourly_totals_for, totals_for};
+use crate::pricing::PricingTable;
+use crate::settings::Settings;
+use crate::tray::{Command as TrayCommand, Tray};
 
 pub struct App {
     snapshot: Arc<Mutex<Arc<Stats>>>,
+    settings: Settings,
+    settings_path: PathBuf,
+    pricing_path: PathBuf,
+    tray_events: mpsc::Receiver<TrayCommand>,
+    _tray: Tray,
     styled: bool,
+    view: View,
+    window_visible: bool,
+    quitting: bool,
 }
 
 // Only two hues carry meaning: which tool produced the usage. Everything else
@@ -27,12 +39,90 @@ const TRACK: Color32 = Color32::from_rgb(27, 35, 48);
 const MARGIN: i8 = 12;
 const CHART_HEIGHT: f32 = 40.0;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum View {
+    Today,
+    Week,
+    History,
+}
+
+impl View {
+    fn next(self) -> Self {
+        match self {
+            Self::Today => Self::Week,
+            Self::Week => Self::History,
+            Self::History => Self::Today,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Today => "Today",
+            Self::Week => "Week",
+            Self::History => "History",
+        }
+    }
+}
+
 impl App {
-    pub fn new(snapshot: Arc<Mutex<Arc<Stats>>>) -> Self {
+    pub fn new(
+        snapshot: Arc<Mutex<Arc<Stats>>>,
+        settings: Settings,
+        settings_path: PathBuf,
+        pricing_path: PathBuf,
+        tray_events: mpsc::Receiver<TrayCommand>,
+        tray: Tray,
+    ) -> Self {
         App {
             snapshot,
+            settings,
+            settings_path,
+            pricing_path,
+            tray_events,
+            _tray: tray,
             styled: false,
+            view: View::Today,
+            window_visible: true,
+            quitting: false,
         }
+    }
+
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.tray_events.try_recv() {
+            match command {
+                TrayCommand::ToggleWindow => {
+                    self.window_visible = !self.window_visible;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+                }
+                TrayCommand::ToggleCloseToTray => {
+                    self.settings.close_to_tray = !self.settings.close_to_tray;
+                    self.save_settings();
+                }
+                TrayCommand::ToggleNotifications => {
+                    self.settings.notifications_enabled = !self.settings.notifications_enabled;
+                    self.save_settings();
+                }
+                TrayCommand::OpenPricing => {
+                    if let Err(error) = std::process::Command::new("explorer")
+                        .arg(&self.pricing_path)
+                        .spawn()
+                    {
+                        eprintln!("warning: failed opening pricing.json: {error}");
+                    }
+                }
+                TrayCommand::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn save_settings(&self) {
+        if let Err(error) = self.settings.save(&self.settings_path) {
+            eprintln!("warning: failed saving settings: {error}");
+        }
+        self._tray.sync_settings(self.settings);
     }
 
     fn source_color(source: Source) -> Color32 {
@@ -59,7 +149,7 @@ impl App {
         ctx.set_theme(egui::Theme::Dark);
         ctx.set_visuals_of(egui::Theme::Dark, visuals);
         ctx.style_mut_of(egui::Theme::Dark, |style| {
-            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            style.spacing.item_spacing = egui::vec2(6.0, 1.0);
             style.spacing.scroll.bar_width = 4.0;
             style.spacing.scroll.floating = true;
         });
@@ -263,6 +353,17 @@ fn hourly_chart(ui: &mut egui::Ui, stats: &Stats, height: f32) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.style(ui.ctx());
+        self.handle_tray_events(ui.ctx());
+        if self.settings.close_to_tray
+            && !self.quitting
+            && ui.ctx().input(|input| input.viewport().close_requested())
+        {
+            self.window_visible = false;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let stats = self.snapshot.lock().unwrap().clone();
@@ -271,10 +372,15 @@ impl eframe::App for App {
         egui::Frame::new()
             .inner_margin(egui::Margin::same(MARGIN))
             .show(ui, |ui| {
+                if self.view != View::Today {
+                    self.ledger(ui, &stats);
+                    return;
+                }
                 // Stack the chart up from the bottom edge, then let everything
                 // else fill the slack above it. Splitting the two by hand meant
                 // subtracting a constant, and a wrong constant silently clipped
-                // the caption off the bottom of the window.
+                // the caption off the bottom of the window (or, the other
+                // direction, let the dashboard overflow into the chart).
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(label("TOKENS / HOUR", 9.0, MUTED));
@@ -297,13 +403,8 @@ impl eframe::App for App {
 
 impl App {
     /// Everything above the chart: header, hero figure, quota meters, feed.
-    fn dashboard(&self, ui: &mut egui::Ui, stats: &Stats, totals: &crate::model::Totals) {
-        ui.horizontal(|ui| {
-            ui.label(label("Today", 12.0, MUTED));
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                live_indicator(ui, stats);
-            });
-        });
+    fn dashboard(&mut self, ui: &mut egui::Ui, stats: &Stats, totals: &Totals) {
+        self.view_header(ui, stats);
         ui.add_space(3.0);
 
         // The hero: the one number worth reading from across the room.
@@ -338,6 +439,7 @@ impl App {
 
         divider(ui);
         heading(ui, "QUOTA");
+        status_marker(ui, stats, PricingTable::load(&self.pricing_path).is_err());
         reset_row(
             ui,
             "Claude · session",
@@ -366,6 +468,129 @@ impl App {
         // left here is exactly the feed's.
         activity_feed(ui, stats, ui.available_height());
     }
+
+    fn view_header(&mut self, ui: &mut egui::Ui, stats: &Stats) {
+        ui.horizontal(|ui| {
+            if ui.small_button(self.view.label()).clicked() {
+                self.view = self.view.next();
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                live_indicator(ui, stats);
+            });
+        });
+    }
+
+    fn ledger(&mut self, ui: &mut egui::Ui, stats: &Stats) {
+        // The header may advance the view during this frame. Keep rendering
+        // the view that entered the ledger; Today renders on the next frame.
+        let view = self.view;
+        self.view_header(ui, stats);
+        let pricing = PricingTable::load(&self.pricing_path).ok();
+        status_marker(ui, stats, pricing.is_none());
+        divider(ui);
+
+        match view {
+            View::Week => {
+                heading(ui, "LAST 7 DAYS");
+                for offset in (0..7).rev() {
+                    let day = stats.current_day - chrono::Duration::days(offset);
+                    let totals = if day == stats.current_day {
+                        totals_for(stats, None, None)
+                    } else {
+                        historical_totals(stats, pricing.as_ref(), day, day)
+                    };
+                    let name = if offset == 0 {
+                        "Today".to_string()
+                    } else {
+                        day.format("%a %d").to_string()
+                    };
+                    totals_row(ui, &name, &totals);
+                }
+                divider(ui);
+                heading(ui, "LIVE TODAY");
+                activity_feed(ui, stats, ui.available_height());
+            }
+            View::History => {
+                egui::ScrollArea::vertical()
+                    .max_height(history_scroll_height(ui.available_height()))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        heading(ui, "RECENT DAYS");
+                        for offset in 1..=14 {
+                            let day = stats.current_day - chrono::Duration::days(offset);
+                            let totals = historical_totals(stats, pricing.as_ref(), day, day);
+                            if totals.total_tokens() > 0 {
+                                totals_row(ui, &day.format("%a %d %b").to_string(), &totals);
+                            }
+                        }
+                        divider(ui);
+                        heading(ui, "WEEKLY TOTALS");
+                        for week in 1..=4 {
+                            let end = stats.current_day - chrono::Duration::days((week * 7) as i64);
+                            let start = end - chrono::Duration::days(6);
+                            let totals = historical_totals(stats, pricing.as_ref(), start, end);
+                            if totals.total_tokens() > 0 {
+                                totals_row(
+                                    ui,
+                                    &format!("{}–{}", start.format("%d %b"), end.format("%d %b")),
+                                    &totals,
+                                );
+                            }
+                        }
+                    });
+            }
+            View::Today => unreachable!(),
+        }
+    }
+}
+
+fn history_scroll_height(available: f32) -> f32 {
+    available.max(0.0)
+}
+
+fn historical_totals(
+    stats: &Stats,
+    pricing: Option<&PricingTable>,
+    start: chrono::NaiveDate,
+    end: chrono::NaiveDate,
+) -> Totals {
+    pricing.map_or_else(Totals::default, |pricing| {
+        stats
+            .history
+            .priced_totals_in(start..=end, pricing, None, None)
+    })
+}
+
+fn totals_row(ui: &mut egui::Ui, name: &str, totals: &Totals) {
+    ui.horizontal(|ui| {
+        ui.label(label(name, 11.0, MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            ui.label(number(format!("${:.2}", totals.cost), 11.0, TEXT));
+            ui.label(number(format_compact(totals.total_tokens()), 11.0, MUTED));
+        });
+    });
+    ui.add_space(3.0);
+}
+
+fn status_marker(ui: &mut egui::Ui, stats: &Stats, pricing_invalid: bool) {
+    if pricing_invalid
+        || !stats.unknown_pricing_models.is_empty()
+        || stats.quota_is_stale_at(chrono::Utc::now())
+    {
+        let mut markers = Vec::new();
+        if pricing_invalid || !stats.unknown_pricing_models.is_empty() {
+            markers.push("pricing invalid");
+        }
+        if stats.quota_is_stale_at(chrono::Utc::now()) {
+            markers.push("quota stale");
+        }
+        ui.label(label(
+            &markers.join(" · "),
+            10.0,
+            Color32::from_rgb(224, 171, 81),
+        ));
+        ui.add_space(3.0);
+    }
 }
 
 /// Pulses while usage is still arriving, so the window reads as live rather
@@ -393,9 +618,10 @@ fn live_indicator(ui: &mut egui::Ui, stats: &Stats) {
 const FEED_ROW: f32 = 22.0;
 
 fn activity_feed(ui: &mut egui::Ui, stats: &Stats, available: f32) {
-    let height = (available / FEED_ROW).floor() * FEED_ROW;
+    let height = activity_height(available);
     egui::ScrollArea::vertical()
         .max_height(height)
+        .min_scrolled_height(0.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             // Rows must pitch at exactly FEED_ROW for the flooring above to
@@ -435,6 +661,10 @@ fn activity_feed(ui: &mut egui::Ui, stats: &Stats, available: f32) {
         });
 }
 
+fn activity_height(available: f32) -> f32 {
+    (available.max(0.0) / FEED_ROW).floor() * FEED_ROW
+}
+
 /// Vendor prefixes are redundant once the source rule is colored, and they
 /// push the model name into the token column on a 360px window.
 fn short_model(model: &str) -> &str {
@@ -447,6 +677,25 @@ fn short_model(model: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn view_button_cycles_today_week_history_today() {
+        assert_eq!(View::Today.next(), View::Week);
+        assert_eq!(View::Week.next(), View::History);
+        assert_eq!(View::History.next(), View::Today);
+    }
+
+    #[test]
+    fn history_scroll_height_never_goes_negative() {
+        assert_eq!(history_scroll_height(-1.0), 0.0);
+        assert_eq!(history_scroll_height(120.0), 120.0);
+    }
+
+    #[test]
+    fn activity_height_reserves_the_chart_footer_without_slicing_a_row() {
+        assert_eq!(activity_height(-1.0), 0.0);
+        assert_eq!(activity_height(FEED_ROW * 2.0 + 1.0), FEED_ROW * 2.0);
+    }
 
     #[test]
     fn format_int_inserts_commas_every_three_digits() {

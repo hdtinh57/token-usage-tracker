@@ -2,12 +2,17 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::NaiveDate;
 
+use crate::history::History;
+#[cfg(test)]
+use crate::history::RawTotals;
 use crate::pricing::PricingTable;
 use crate::quota::ClaudeQuota;
 
 pub const FEED_CAPACITY: usize = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Source {
     Claude,
     Codex,
@@ -78,6 +83,7 @@ pub struct FeedEntry {
 #[derive(Debug, Clone)]
 pub struct Stats {
     pub current_day: NaiveDate,
+    pub history: History,
     pub by_model: HashMap<(Source, String), Totals>,
     pub by_hour: HashMap<(Source, String), [Totals; 24]>,
     pub unknown_pricing_models: HashSet<String>,
@@ -94,12 +100,16 @@ pub struct Stats {
     /// windows `None`) until the first successful poll, and left at the last
     /// good reading if a later poll fails.
     pub claude_quota: ClaudeQuota,
+    /// Timestamp of the last successful account quota poll. Kept separately
+    /// from window resets so the UI can say when the displayed quota is old.
+    pub quota_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Stats {
     pub fn new(today: NaiveDate) -> Self {
         Stats {
             current_day: today,
+            history: History::default(),
             by_model: HashMap::new(),
             by_hour: HashMap::new(),
             unknown_pricing_models: HashSet::new(),
@@ -108,6 +118,7 @@ impl Stats {
             codex_used_percent: None,
             codex_last_event: None,
             claude_quota: ClaudeQuota::default(),
+            quota_updated_at: None,
         }
     }
 
@@ -119,6 +130,13 @@ impl Stats {
     /// When the current Claude 7-day window resets, as the account reports it.
     pub fn claude_weekly_reset_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.claude_quota.seven_day.map(|window| window.resets_at)
+    }
+
+    pub fn quota_is_stale_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let stale_after = chrono::Duration::from_std(crate::quota::POLL_INTERVAL * 2)
+            .expect("quota poll interval fits chrono duration");
+        self.quota_updated_at
+            .is_none_or(|updated| now - updated > stale_after)
     }
 
     pub fn rollover_if_needed(&mut self, today: NaiveDate) {
@@ -152,9 +170,9 @@ impl Stats {
 
     /// Only Codex's quota comes from events — it ships `resets_at` on each
     /// one. Claude's arrives out-of-band, from `crate::quota`.
-    fn track_quota(&mut self, ev: &UsageEvent) {
+    fn track_quota(&mut self, ev: &UsageEvent) -> bool {
         if ev.source != Source::Codex {
-            return;
+            return false;
         }
         // Startup scans files independently, so ingestion order is not
         // event-time order. Only the newest event can describe the current
@@ -163,11 +181,13 @@ impl Stats {
             self.codex_last_event = Some(ev.ts);
             self.codex_reset_at = ev.reset_at;
             self.codex_used_percent = ev.reset_used_percent;
+            return true;
         }
+        false
     }
 }
 
-pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) {
+pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) -> bool {
     let (cost_delta, unknown) = match pricing.lookup(&ev.model) {
         Some(p) => (
             p.cost_for_tokens(ev.input, ev.output, ev.cache_read, ev.cache_write),
@@ -179,15 +199,15 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
     // aggregates: they update from every parsed event regardless of the day
     // filter below.
     stats.push_feed(ev, cost_delta);
-    stats.track_quota(ev);
+    let codex_quota_updated = stats.track_quota(ev);
 
     let local_ts = ev.ts.with_timezone(&chrono::Local);
     if local_ts.date_naive() != stats.current_day {
-        return;
+        return codex_quota_updated;
     }
     let hour = local_ts.hour_index();
 
-    if unknown {
+    if unknown && [ev.input, ev.output, ev.cache_read, ev.cache_write] != [0; 4] {
         stats.unknown_pricing_models.insert(ev.model.clone());
     }
 
@@ -202,6 +222,7 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
         .entry(key)
         .or_insert_with(|| [Totals::default(); 24])[hour]
         .add_tokens(ev, cost_delta);
+    codex_quota_updated
 }
 
 pub fn reprice(stats: &mut Stats, pricing: &PricingTable) {
@@ -259,6 +280,53 @@ pub fn hourly_totals_for(
         }
     }
     acc
+}
+
+#[cfg(test)]
+pub fn history_totals_for(
+    stats: &Stats,
+    start: NaiveDate,
+    end: NaiveDate,
+    model: Option<&str>,
+    source: Option<Source>,
+) -> RawTotals {
+    stats.history.totals_in(start..=end, model, source)
+}
+
+#[cfg(test)]
+pub fn weekly_totals_for(
+    stats: &Stats,
+    pricing: &PricingTable,
+    model: Option<&str>,
+    source: Option<Source>,
+) -> Totals {
+    let mut totals = stats.history.priced_totals_in(
+        (stats.current_day - chrono::Duration::days(6))..=stats.current_day,
+        pricing,
+        model,
+        source,
+    );
+    for ((entry_source, entry_model), current) in &stats.by_model {
+        if model.is_some_and(|filter| entry_model != filter)
+            || source.is_some_and(|filter| *entry_source != filter)
+        {
+            continue;
+        }
+        totals.input += current.input;
+        totals.output += current.output;
+        totals.cache_read += current.cache_read;
+        totals.cache_write += current.cache_write;
+        totals.requests += current.requests;
+        if let Some(price) = pricing.lookup(entry_model) {
+            totals.cost += price.cost_for_tokens(
+                current.input,
+                current.output,
+                current.cache_read,
+                current.cache_write,
+            );
+        }
+    }
+    totals
 }
 
 trait HourIndex {
@@ -434,6 +502,17 @@ mod tests {
     }
 
     #[test]
+    fn zero_token_unknown_model_does_not_invalidate_pricing() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        let ev = event_on(today, 10, Source::Claude, "<synthetic>", 0);
+
+        ingest_event(&mut stats, &ev, &table_with_sonnet());
+
+        assert!(stats.unknown_pricing_models.is_empty());
+    }
+
+    #[test]
     fn totals_for_filters_by_model_and_source_independently() {
         let today = chrono::Local::now().date_naive();
         let mut stats = Stats::new(today);
@@ -514,6 +593,58 @@ mod tests {
 
         assert!((totals_for(&stats, None, None).cost - 2.0).abs() < 1e-9);
         assert!((hourly_totals_for(&stats, None, None)[5].cost - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weekly_totals_use_raw_history_with_current_pricing() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut stats = Stats::new(today);
+        stats.history.add(
+            today - chrono::Duration::days(6),
+            Source::Claude,
+            "claude-sonnet-4-6",
+            crate::history::RawTotals {
+                input: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        stats.history.add(
+            today - chrono::Duration::days(7),
+            Source::Claude,
+            "claude-sonnet-4-6",
+            crate::history::RawTotals {
+                input: 9_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        stats.by_model.insert(
+            (Source::Claude, "claude-sonnet-4-6".to_string()),
+            Totals {
+                input: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "claude-sonnet-4".to_string(),
+            Price {
+                input: 2.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+        );
+        let totals = weekly_totals_for(&stats, &PricingTable::from_map(pricing), None, None);
+        assert_eq!(
+            history_totals_for(&stats, today - chrono::Duration::days(6), today, None, None).input,
+            1_000_000
+        );
+        assert_eq!(totals.input, 2_000_000);
+        assert_eq!(totals.requests, 2);
+        assert_eq!(totals.cost, 4.0);
     }
 
     #[test]
@@ -615,5 +746,17 @@ mod tests {
         ingest_event(&mut stats, &newest, &table_with_sonnet());
         ingest_event(&mut stats, &older, &table_with_sonnet());
         assert_eq!(stats.codex_reset_at, newest.reset_at);
+    }
+
+    #[test]
+    fn quota_is_stale_after_two_poll_intervals() {
+        let mut stats = Stats::new(chrono::Local::now().date_naive());
+        let now = Utc::now();
+        let stale_after = chrono::Duration::from_std(crate::quota::POLL_INTERVAL * 2).unwrap();
+        assert!(stats.quota_is_stale_at(now));
+        stats.quota_updated_at = Some(now - stale_after);
+        assert!(!stats.quota_is_stale_at(now));
+        stats.quota_updated_at = Some(now - stale_after - chrono::Duration::seconds(1));
+        assert!(stats.quota_is_stale_at(now));
     }
 }
