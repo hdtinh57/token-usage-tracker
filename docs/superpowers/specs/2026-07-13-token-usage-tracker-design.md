@@ -75,9 +75,30 @@ Worker owns all aggregation state and writes a coalesced snapshot (`Arc<Stats>`)
 Hot-reload piggybacks on the existing slow tick (~20s): check `pricing.json`'s mtime, and if changed, reload the table and recompute `cost` for every existing `Totals` entry from its already-stored raw token components × the new prices. This is O(number of distinct models/hours/sources) — a handful of entries — never O(number of events processed so far), so it stays cheap regardless of log volume. Cost already accrued reflects whatever price was current at ingest time until the next reload; a reload re-prices the whole current "today" window under the new price rather than leaving it split across two price regimes.
 
 ### UI (egui)
-- Model combo box filter (default "All")
-- Stat rows: Input / Output / Cache read / Cache write / Total tokens / Est. cost
-- Line chart (`egui_plot`) of tokens per hour-of-day (24 points), rolling daily
+Single resizable window, no tabs/menu, system light/dark theme (egui default, no custom theming).
+
+```
+┌────────────────────────────────────────────────┐
+│ Token Usage Tracker                     [_][□][X]│
+├────────────────────────────────────────────────┤
+│ Model: [ All ▾ ]        Source: [ All ▾ ]         │
+├────────────────────────────────────────────────┤
+│  Input           1,234,567 tok                    │
+│  Output            234,567 tok                    │
+│  Cache read      2,345,678 tok                    │
+│  Cache write       123,456 tok                    │
+│  ──────────────────────────                      │
+│  Total           3,938,268 tok                    │
+│  Est. cost              $12.34                    │
+├────────────────────────────────────────────────┤
+│ Tokens / hour (today)                              │
+│  [line chart, x = hour 0-23, y = tokens]           │
+└────────────────────────────────────────────────┘
+```
+
+- Two combo boxes filter both the stat rows and the chart: **Model** (All / each model seen today) and **Source** (All / Claude Code / Codex).
+- Stat rows are plain label + number, no gauges/progress bars — scannable at a glance.
+- Chart: `egui_plot` line, x = local hour-of-day (0-23), y = tokens that hour, redrawn from the latest snapshot each UI wake (~1s).
 
 ### Error handling
 Any file/line-level failure (bad UTF-8, malformed JSON, missing fields) is skipped and logged to stderr; never crashes the app.
