@@ -291,6 +291,7 @@ impl Worker {
         self.last_quota_poll = Some(std::time::Instant::now());
         if let Some(fetched) = quota::fetch() {
             self.stats.claude_quota = fetched;
+            self.stats.quota_updated_at = Some(chrono::Utc::now());
             self.decide_alerts(
                 Source::Claude,
                 "session",

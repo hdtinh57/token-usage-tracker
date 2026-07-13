@@ -98,6 +98,9 @@ pub struct Stats {
     /// windows `None`) until the first successful poll, and left at the last
     /// good reading if a later poll fails.
     pub claude_quota: ClaudeQuota,
+    /// Timestamp of the last successful account quota poll. Kept separately
+    /// from window resets so the UI can say when the displayed quota is old.
+    pub quota_updated_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Stats {
@@ -113,6 +116,7 @@ impl Stats {
             codex_used_percent: None,
             codex_last_event: None,
             claude_quota: ClaudeQuota::default(),
+            quota_updated_at: None,
         }
     }
 
@@ -124,6 +128,13 @@ impl Stats {
     /// When the current Claude 7-day window resets, as the account reports it.
     pub fn claude_weekly_reset_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
         self.claude_quota.seven_day.map(|window| window.resets_at)
+    }
+
+    pub fn quota_is_stale_at(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        let stale_after = chrono::Duration::from_std(crate::quota::POLL_INTERVAL * 2)
+            .expect("quota poll interval fits chrono duration");
+        self.quota_updated_at
+            .is_none_or(|updated| now - updated > stale_after)
     }
 
     pub fn rollover_if_needed(&mut self, today: NaiveDate) {
@@ -717,5 +728,17 @@ mod tests {
         ingest_event(&mut stats, &newest, &table_with_sonnet());
         ingest_event(&mut stats, &older, &table_with_sonnet());
         assert_eq!(stats.codex_reset_at, newest.reset_at);
+    }
+
+    #[test]
+    fn quota_is_stale_after_two_poll_intervals() {
+        let mut stats = Stats::new(chrono::Local::now().date_naive());
+        let now = Utc::now();
+        let stale_after = chrono::Duration::from_std(crate::quota::POLL_INTERVAL * 2).unwrap();
+        assert!(stats.quota_is_stale_at(now));
+        stats.quota_updated_at = Some(now - stale_after);
+        assert!(!stats.quota_is_stale_at(now));
+        stats.quota_updated_at = Some(now - stale_after - chrono::Duration::seconds(1));
+        assert!(stats.quota_is_stale_at(now));
     }
 }
