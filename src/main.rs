@@ -1,3 +1,4 @@
+mod alerts;
 mod discovery;
 mod history;
 mod model;
@@ -6,6 +7,7 @@ mod parse_codex;
 mod paths;
 mod pricing;
 mod quota;
+mod settings;
 mod tail;
 mod ui;
 mod watch;

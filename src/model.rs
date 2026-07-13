@@ -157,9 +157,9 @@ impl Stats {
 
     /// Only Codex's quota comes from events — it ships `resets_at` on each
     /// one. Claude's arrives out-of-band, from `crate::quota`.
-    fn track_quota(&mut self, ev: &UsageEvent) {
+    fn track_quota(&mut self, ev: &UsageEvent) -> bool {
         if ev.source != Source::Codex {
-            return;
+            return false;
         }
         // Startup scans files independently, so ingestion order is not
         // event-time order. Only the newest event can describe the current
@@ -168,11 +168,13 @@ impl Stats {
             self.codex_last_event = Some(ev.ts);
             self.codex_reset_at = ev.reset_at;
             self.codex_used_percent = ev.reset_used_percent;
+            return true;
         }
+        false
     }
 }
 
-pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) {
+pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) -> bool {
     let (cost_delta, unknown) = match pricing.lookup(&ev.model) {
         Some(p) => (
             p.cost_for_tokens(ev.input, ev.output, ev.cache_read, ev.cache_write),
@@ -184,11 +186,11 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
     // aggregates: they update from every parsed event regardless of the day
     // filter below.
     stats.push_feed(ev, cost_delta);
-    stats.track_quota(ev);
+    let codex_quota_updated = stats.track_quota(ev);
 
     let local_ts = ev.ts.with_timezone(&chrono::Local);
     if local_ts.date_naive() != stats.current_day {
-        return;
+        return codex_quota_updated;
     }
     let hour = local_ts.hour_index();
 
@@ -207,6 +209,7 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
         .entry(key)
         .or_insert_with(|| [Totals::default(); 24])[hour]
         .add_tokens(ev, cost_delta);
+    codex_quota_updated
 }
 
 pub fn reprice(stats: &mut Stats, pricing: &PricingTable) {

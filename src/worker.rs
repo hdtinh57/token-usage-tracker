@@ -6,13 +6,15 @@ use std::time::{Duration, SystemTime};
 use chrono::Local;
 use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 
+use crate::alerts::AlertState;
 use crate::discovery::{collect_mtimes, select_active, walk_jsonl_files};
 use crate::history::RawTotals;
-use crate::model::{Stats, ingest_event, reprice};
+use crate::model::{Source, Stats, ingest_event, reprice};
 use crate::parse_claude::ClaudeSessionParser;
 use crate::parse_codex::CodexSessionParser;
 use crate::pricing::PricingTable;
 use crate::quota;
+use crate::settings::Settings;
 use crate::tail::Tailer;
 use crate::watch::PendingPaths;
 
@@ -26,6 +28,9 @@ pub struct Worker {
     codex_root: PathBuf,
     pricing_path: PathBuf,
     history_path: PathBuf,
+    alerts_path: PathBuf,
+    settings: Settings,
+    alerts: AlertState,
     watcher: RecommendedWatcher,
     watch_events: mpsc::Receiver<notify::Result<notify::Event>>,
     pending_paths: PendingPaths,
@@ -50,6 +55,15 @@ impl Worker {
         snapshot: Arc<Mutex<Arc<Stats>>>,
     ) -> std::io::Result<Self> {
         let pricing = PricingTable::load(&pricing_path)?;
+        let app_data = history_path.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "history path has no parent",
+            )
+        })?;
+        let settings = Settings::load(&app_data.join("settings.json"))?;
+        let alerts_path = app_data.join("alerts.json");
+        let alerts = AlertState::load(&alerts_path)?;
         let pricing_mtime = std::fs::metadata(&pricing_path)
             .and_then(|m| m.modified())
             .ok();
@@ -68,6 +82,9 @@ impl Worker {
             codex_root,
             pricing_path,
             history_path: history_path.clone(),
+            alerts_path,
+            settings,
+            alerts,
             watcher,
             watch_events,
             pending_paths: PendingPaths::new(),
@@ -162,8 +179,15 @@ impl Worker {
                         cache_write: event.cache_write,
                         requests: 1,
                     });
-            } else if !today_only || day == self.stats.current_day {
-                ingest_event(&mut self.stats, &event, &self.pricing);
+            } else if (!today_only || day == self.stats.current_day)
+                && ingest_event(&mut self.stats, &event, &self.pricing)
+            {
+                self.decide_alerts(
+                    Source::Codex,
+                    "session",
+                    self.stats.codex_used_percent,
+                    self.stats.codex_reset_at,
+                );
             }
         }
     }
@@ -264,6 +288,40 @@ impl Worker {
         self.last_quota_poll = Some(std::time::Instant::now());
         if let Some(fetched) = quota::fetch() {
             self.stats.claude_quota = fetched;
+            self.decide_alerts(
+                Source::Claude,
+                "session",
+                fetched.five_hour.map(|window| window.utilization),
+                fetched.five_hour.map(|window| window.resets_at),
+            );
+            self.decide_alerts(
+                Source::Claude,
+                "week",
+                fetched.seven_day.map(|window| window.utilization),
+                fetched.seven_day.map(|window| window.resets_at),
+            );
+        }
+    }
+
+    fn decide_alerts(
+        &mut self,
+        source: Source,
+        window: &str,
+        utilization: Option<f64>,
+        reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    ) {
+        if !self.settings.notifications_enabled {
+            return;
+        }
+        let (Some(utilization), Some(reset_at)) = (utilization, reset_at) else {
+            return;
+        };
+        let previous = self.alerts.clone();
+        self.alerts.crossed(source, window, utilization, reset_at);
+        if self.alerts != previous
+            && let Err(error) = self.alerts.save(&self.alerts_path)
+        {
+            eprintln!("warning: failed saving quota alert state: {error}");
         }
     }
 
