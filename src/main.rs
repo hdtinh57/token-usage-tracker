@@ -29,7 +29,12 @@ fn main() -> eframe::Result<()> {
         .expect("failed to initialize worker (check pricing.json permissions)");
     std::thread::spawn(move || worker.run());
 
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default()
+            .with_inner_size([300.0, 420.0])
+            .with_min_inner_size([260.0, 320.0]),
+        ..Default::default()
+    };
     eframe::run_native(
         "Token Usage Tracker",
         options,

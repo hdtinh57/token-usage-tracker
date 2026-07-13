@@ -1,8 +1,10 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::NaiveDate;
 
 use crate::pricing::PricingTable;
+
+pub const FEED_CAPACITY: usize = 20;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Source {
@@ -56,11 +58,24 @@ impl Totals {
 }
 
 #[derive(Debug, Clone)]
+pub struct FeedEntry {
+    pub ts: chrono::DateTime<chrono::Utc>,
+    pub source: Source,
+    pub model: String,
+    pub tokens: u64,
+    pub cost: f64,
+}
+
+#[derive(Debug, Clone)]
 pub struct Stats {
     pub current_day: NaiveDate,
     pub by_model: HashMap<(Source, String), Totals>,
     pub by_hour: HashMap<(Source, String), [Totals; 24]>,
     pub unknown_pricing_models: HashSet<String>,
+    /// Most-recent-first is not enforced here — newest is at the back.
+    /// Not cleared on day rollover: this is a live activity feed, not a
+    /// today-scoped aggregate, so it keeps rolling across midnight.
+    pub feed: VecDeque<FeedEntry>,
 }
 
 impl Stats {
@@ -70,6 +85,7 @@ impl Stats {
             by_model: HashMap::new(),
             by_hour: HashMap::new(),
             unknown_pricing_models: HashSet::new(),
+            feed: VecDeque::new(),
         }
     }
 
@@ -87,15 +103,22 @@ impl Stats {
         keys.sort_by(|a, b| a.1.cmp(&b.1));
         keys
     }
+
+    fn push_feed(&mut self, ev: &UsageEvent, cost: f64) {
+        self.feed.push_back(FeedEntry {
+            ts: ev.ts,
+            source: ev.source,
+            model: ev.model.clone(),
+            tokens: ev.input + ev.output + ev.cache_read + ev.cache_write,
+            cost,
+        });
+        while self.feed.len() > FEED_CAPACITY {
+            self.feed.pop_front();
+        }
+    }
 }
 
 pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) {
-    let local_ts = ev.ts.with_timezone(&chrono::Local);
-    if local_ts.date_naive() != stats.current_day {
-        return;
-    }
-    let hour = local_ts.hour_index();
-
     let (cost_delta, unknown) = match pricing.lookup(&ev.model) {
         Some(p) => (
             p.cost_for_tokens(ev.input, ev.output, ev.cache_read, ev.cache_write),
@@ -103,6 +126,16 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
         ),
         None => (0.0, true),
     };
+    // Feed is a live activity view, not a today-scoped aggregate: every
+    // successfully parsed event lands here regardless of the day filter below.
+    stats.push_feed(ev, cost_delta);
+
+    let local_ts = ev.ts.with_timezone(&chrono::Local);
+    if local_ts.date_naive() != stats.current_day {
+        return;
+    }
+    let hour = local_ts.hour_index();
+
     if unknown {
         stats.unknown_pricing_models.insert(ev.model.clone());
     }
@@ -363,5 +396,37 @@ mod tests {
 
         assert!((totals_for(&stats, None, None).cost - 2.0).abs() < 1e-9);
         assert!((hourly_totals_for(&stats, None, None)[5].cost - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn feed_caps_at_capacity_keeping_only_the_most_recent() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        for i in 0..(FEED_CAPACITY as u64 + 5) {
+            ingest_event(
+                &mut stats,
+                &event_on(today, 10, Source::Claude, "claude-sonnet-4-6", i),
+                &table_with_sonnet(),
+            );
+        }
+        assert_eq!(stats.feed.len(), FEED_CAPACITY);
+        // Oldest 5 (input 0..5) must have been evicted; newest kept.
+        assert_eq!(stats.feed.back().unwrap().tokens, FEED_CAPACITY as u64 + 4);
+        assert_eq!(stats.feed.front().unwrap().tokens, 5);
+    }
+
+    #[test]
+    fn feed_receives_events_even_when_discarded_from_todays_aggregate() {
+        let today = chrono::Local::now().date_naive();
+        let yesterday = today.pred_opt().unwrap();
+        let mut stats = Stats::new(today);
+        ingest_event(
+            &mut stats,
+            &event_on(yesterday, 10, Source::Claude, "claude-sonnet-4-6", 42),
+            &table_with_sonnet(),
+        );
+        assert_eq!(totals_for(&stats, None, None).input, 0); // not in today's aggregate
+        assert_eq!(stats.feed.len(), 1); // but visible in the live feed
+        assert_eq!(stats.feed.back().unwrap().tokens, 42);
     }
 }

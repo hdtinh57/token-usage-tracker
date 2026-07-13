@@ -94,7 +94,7 @@ use crate::tail::Tailer;
 
 const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
 const STARTUP_WINDOW: Duration = Duration::from_secs(48 * 60 * 60);
-pub const FAST_TICK: Duration = Duration::from_secs(2);
+pub const FAST_TICK: Duration = Duration::from_secs(1);
 pub const SLOW_TICK: Duration = Duration::from_secs(20);
 
 pub struct Worker {
