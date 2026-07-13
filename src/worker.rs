@@ -23,6 +23,10 @@ const STARTUP_WINDOW: Duration = Duration::from_secs(48 * 60 * 60);
 pub const FAST_TICK: Duration = Duration::from_secs(1);
 pub const SLOW_TICK: Duration = Duration::from_secs(10 * 60);
 
+fn quota_poll_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.is_none_or(|last| now.saturating_duration_since(last) >= quota::POLL_INTERVAL)
+}
+
 pub struct Worker {
     claude_root: PathBuf,
     codex_root: PathBuf,
@@ -142,6 +146,7 @@ impl Worker {
             }
         }
         self.refresh_active_set(ACTIVE_WINDOW);
+        self.refresh_claude_quota();
     }
 
     fn ingest_whole_file(&mut self, path: &Path) {
@@ -197,6 +202,7 @@ impl Worker {
 
     pub fn fast_tick(&mut self) {
         self.persist_completed_day_if_needed();
+        self.refresh_claude_quota();
         let mut recover = false;
         while let Ok(event) = self.watch_events.try_recv() {
             match event {
@@ -282,10 +288,7 @@ impl Worker {
     /// 10s timeout, so a tick lands late at worst. Move it to its own thread
     /// if the feed ever visibly stutters.
     fn refresh_claude_quota(&mut self) {
-        if self
-            .last_quota_poll
-            .is_some_and(|last| last.elapsed() < quota::POLL_INTERVAL)
-        {
+        if !quota_poll_due(self.last_quota_poll, std::time::Instant::now()) {
             return;
         }
         self.last_quota_poll = Some(std::time::Instant::now());
@@ -384,6 +387,18 @@ fn notify_quota(_source: Source, _window: &str, _threshold: u8) {}
 mod tests {
     use super::*;
     use chrono::TimeZone;
+
+    #[test]
+    fn quota_poll_schedule_runs_immediately_then_at_the_rate_limit() {
+        let now = std::time::Instant::now();
+
+        assert!(quota_poll_due(None, now));
+        assert!(!quota_poll_due(
+            Some(now - quota::POLL_INTERVAL + Duration::from_secs(1)),
+            now
+        ));
+        assert!(quota_poll_due(Some(now - quota::POLL_INTERVAL), now));
+    }
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::SystemTime;
