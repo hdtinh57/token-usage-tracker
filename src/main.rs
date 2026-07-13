@@ -3,6 +3,7 @@ mod model;
 mod parse_claude;
 mod parse_codex;
 mod pricing;
+mod quota;
 mod tail;
 mod ui;
 mod worker;

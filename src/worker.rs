@@ -10,6 +10,7 @@ use crate::model::{Stats, ingest_event, reprice};
 use crate::parse_claude::ClaudeSessionParser;
 use crate::parse_codex::CodexSessionParser;
 use crate::pricing::PricingTable;
+use crate::quota;
 use crate::tail::Tailer;
 
 const ACTIVE_WINDOW: Duration = Duration::from_secs(30 * 60);
@@ -28,6 +29,7 @@ pub struct Worker {
     pricing: PricingTable,
     pricing_mtime: Option<SystemTime>,
     stats: Stats,
+    last_quota_poll: Option<std::time::Instant>,
     snapshot: Arc<Mutex<Arc<Stats>>>,
 }
 
@@ -53,6 +55,7 @@ impl Worker {
             pricing,
             pricing_mtime,
             stats: Stats::new(Local::now().date_naive()),
+            last_quota_poll: None,
             snapshot,
         })
     }
@@ -130,6 +133,28 @@ impl Worker {
     pub fn slow_tick(&mut self) {
         self.refresh_active_set(ACTIVE_WINDOW);
         self.reload_pricing_if_changed();
+        self.refresh_claude_quota();
+    }
+
+    /// Polls the account for Claude's real quota windows. A failed poll (no
+    /// network, expired token) leaves the last good reading in place rather
+    /// than blanking the rows.
+    ///
+    /// ponytail: the request blocks this worker thread for up to its timeout,
+    /// which can stall a fast tick — it is one call every 3 minutes against a
+    /// 10s timeout, so a tick lands late at worst. Move it to its own thread
+    /// if the feed ever visibly stutters.
+    fn refresh_claude_quota(&mut self) {
+        if self
+            .last_quota_poll
+            .is_some_and(|last| last.elapsed() < quota::POLL_INTERVAL)
+        {
+            return;
+        }
+        self.last_quota_poll = Some(std::time::Instant::now());
+        if let Some(fetched) = quota::fetch() {
+            self.stats.claude_quota = fetched;
+        }
     }
 
     fn reload_pricing_if_changed(&mut self) {

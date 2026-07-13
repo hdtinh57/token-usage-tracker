@@ -1,39 +1,37 @@
 use chrono::Timelike;
 use eframe::egui::{self, Color32, Stroke};
-use egui_plot::{Bar, BarChart, Legend, Plot};
 use std::sync::{Arc, Mutex};
 
 use crate::model::{Source, Stats, hourly_totals_for, totals_for};
 
 pub struct App {
     snapshot: Arc<Mutex<Arc<Stats>>>,
-    visuals_configured: bool,
+    styled: bool,
 }
 
+// Only two hues carry meaning: which tool produced the usage. Everything else
+// is greyscale, so the numbers — not the decoration — are what the eye lands on.
+const CLAUDE: Color32 = Color32::from_rgb(232, 148, 74);
 const CODEX: Color32 = Color32::from_rgb(76, 159, 255);
-const CLAUDE: Color32 = Color32::from_rgb(255, 163, 72);
-const SURFACE: Color32 = Color32::from_rgb(20, 27, 36);
-const SURFACE_RAISED: Color32 = Color32::from_rgb(27, 36, 47);
-const BORDER: Color32 = Color32::from_rgb(53, 67, 82);
-const MUTED: Color32 = Color32::from_rgb(145, 160, 176);
-// Distinct from CODEX/CLAUDE so the top-row token chips never get mistaken
-// for a source color: green=in, rose=out, violet=cache.
-const IN_COLOR: Color32 = Color32::from_rgb(74, 222, 128);
-const OUT_COLOR: Color32 = Color32::from_rgb(248, 113, 113);
-const CACHE_COLOR: Color32 = Color32::from_rgb(192, 132, 252);
+
+const BG: Color32 = Color32::from_rgb(15, 19, 25);
+const TEXT: Color32 = Color32::from_rgb(232, 237, 242);
+const MUTED: Color32 = Color32::from_rgb(122, 136, 153);
+const DIVIDER: Color32 = Color32::from_rgb(33, 42, 53);
+const TRACK: Color32 = Color32::from_rgb(27, 35, 48);
+
+// 450px of window height is a hard budget: hero, quota, feed and chart all
+// have to come out of it. Every space below was measured against that, not
+// picked by feel — the feed is the flexible one, so slack anywhere else is
+// slack taken directly out of it.
+const MARGIN: i8 = 12;
+const CHART_HEIGHT: f32 = 40.0;
 
 impl App {
     pub fn new(snapshot: Arc<Mutex<Arc<Stats>>>) -> Self {
         App {
             snapshot,
-            visuals_configured: false,
-        }
-    }
-
-    fn source_tag(source: Source) -> &'static str {
-        match source {
-            Source::Claude => "CC",
-            Source::Codex => "CX",
+            styled: false,
         }
     }
 
@@ -44,34 +42,56 @@ impl App {
         }
     }
 
-    fn configure_visuals(&mut self, ctx: &egui::Context) {
-        if self.visuals_configured {
+    fn style(&mut self, ctx: &egui::Context) {
+        if self.styled {
             return;
         }
+        install_fonts(ctx);
+
         let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = Color32::from_rgb(14, 19, 27);
-        visuals.window_fill = SURFACE;
-        visuals.faint_bg_color = SURFACE_RAISED;
-        visuals.extreme_bg_color = Color32::from_rgb(10, 15, 22);
-        visuals.code_bg_color = SURFACE_RAISED;
-        visuals.selection.bg_fill = CODEX.gamma_multiply(0.35);
-        visuals.selection.stroke = Stroke::new(1.0, CODEX);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER);
-        visuals.widgets.inactive.bg_fill = SURFACE_RAISED;
-        visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
-        visuals.widgets.hovered.bg_fill = Color32::from_rgb(33, 49, 61);
-        visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, CODEX);
-        visuals.widgets.active.bg_fill = Color32::from_rgb(38, 60, 69);
-        visuals.widgets.active.bg_stroke = Stroke::new(1.0, CODEX);
+        visuals.panel_fill = BG;
+        visuals.window_fill = BG;
+        visuals.extreme_bg_color = BG;
+        visuals.override_text_color = Some(TEXT);
+        // Nothing in this window is clickable, so every widget outline egui
+        // would otherwise draw is noise.
+        visuals.widgets.noninteractive.bg_stroke = Stroke::NONE;
         ctx.set_theme(egui::Theme::Dark);
         ctx.set_visuals_of(egui::Theme::Dark, visuals);
         ctx.style_mut_of(egui::Theme::Dark, |style| {
-            style.spacing.item_spacing = egui::vec2(6.0, 6.0);
-            style.spacing.button_padding = egui::vec2(8.0, 5.0);
-            style.spacing.interact_size.y = 28.0;
+            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            style.spacing.scroll.bar_width = 4.0;
+            style.spacing.scroll.floating = true;
         });
-        self.visuals_configured = true;
+        self.styled = true;
     }
+}
+
+/// Swap egui's bundled fonts for the system UI face and a monospace with
+/// tabular figures — without this the digits shift horizontally on every
+/// update, which is the single most amateur-looking thing a live counter
+/// can do. Falls back to egui's defaults if the files aren't there.
+fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    let load = |path: &str| std::fs::read(path).ok().map(egui::FontData::from_owned);
+
+    if let Some(ui_font) = load(r"C:\Windows\Fonts\segoeui.ttf") {
+        fonts.font_data.insert("ui".into(), Arc::new(ui_font));
+        fonts
+            .families
+            .entry(egui::FontFamily::Proportional)
+            .or_default()
+            .insert(0, "ui".into());
+    }
+    if let Some(mono_font) = load(r"C:\Windows\Fonts\CascadiaMono.ttf") {
+        fonts.font_data.insert("mono".into(), Arc::new(mono_font));
+        fonts
+            .families
+            .entry(egui::FontFamily::Monospace)
+            .or_default()
+            .insert(0, "mono".into());
+    }
+    ctx.set_fonts(fonts);
 }
 
 /// Thousand-separated integer, e.g. `1234567` -> `"1,234,567"`.
@@ -103,218 +123,325 @@ fn format_compact(n: u64) -> String {
     }
 }
 
-fn surface() -> egui::Frame {
-    egui::Frame::new()
-        .fill(SURFACE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .corner_radius(8)
-        .inner_margin(egui::Margin::same(10))
-}
-
-fn metric(ui: &mut egui::Ui, label: &str, value: String, color: Color32, size: f32) {
-    ui.label(egui::RichText::new(label).small().color(MUTED));
-    ui.add_space(2.0);
-    ui.label(
-        egui::RichText::new(value)
-            .monospace()
-            .size(size)
-            .strong()
-            .color(color),
-    );
-}
-
-/// A single `icon value` chip, color-coded so the icon and its number read
-/// as one unit at a glance instead of requiring the glyph to be parsed.
-fn chip(ui: &mut egui::Ui, icon: &str, value: String, color: Color32) {
-    ui.label(
-        egui::RichText::new(icon)
-            .monospace()
-            .size(12.0)
-            .strong()
-            .color(color),
-    );
-    ui.label(
-        egui::RichText::new(value)
-            .monospace()
-            .size(12.0)
-            .strong()
-            .color(color),
-    );
-}
-
-/// Remaining time until `target`, compact: `"2h14m"`, `"3d5h"`, or `"now"`
+/// Remaining time until `target`, compact: `"2h 14m"`, `"3d 5h"`, or `"now"`
 /// once the window has already rolled over.
 fn format_remaining(target: chrono::DateTime<chrono::Utc>) -> String {
     let minutes = (target - chrono::Utc::now()).num_minutes();
     if minutes <= 0 {
         "now".to_string()
     } else if minutes >= 60 * 24 {
-        format!("{}d{}h", minutes / (60 * 24), (minutes / 60) % 24)
+        format!("{}d {}h", minutes / (60 * 24), (minutes / 60) % 24)
     } else if minutes >= 60 {
-        format!("{}h{}m", minutes / 60, minutes % 60)
+        format!("{}h {}m", minutes / 60, minutes % 60)
     } else {
         format!("{minutes}m")
     }
 }
 
-/// A `TAG value` quota-reset chip, e.g. `CC 2h14m`.
-fn reset_chip(
+fn label(text: &str, size: f32, color: Color32) -> egui::RichText {
+    egui::RichText::new(text).size(size).color(color)
+}
+
+fn number(text: String, size: f32, color: Color32) -> egui::RichText {
+    egui::RichText::new(text)
+        .monospace()
+        .size(size)
+        .color(color)
+}
+
+/// Section heading. Deliberately quiet — it orients, it does not compete with
+/// the values underneath it.
+fn heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .size(10.0)
+            .color(MUTED)
+            .extra_letter_spacing(0.8),
+    );
+    ui.add_space(3.0);
+}
+
+fn divider(ui: &mut egui::Ui) {
+    ui.add_space(6.0);
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 1.0), egui::Sense::hover());
+    ui.painter()
+        .hline(rect.x_range(), rect.center().y, Stroke::new(1.0, DIVIDER));
+    ui.add_space(6.0);
+}
+
+/// A quota row: name, time left, and a hairline meter. `fill` is what the
+/// meter shows, in `0.0..=1.0` — for Claude that is the account's real
+/// utilization (quota consumed), for Codex, which reports no utilization, it
+/// falls back to how far through the window we are.
+fn reset_row(
     ui: &mut egui::Ui,
-    tag: &str,
+    name: &str,
     color: Color32,
     reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    fill: Option<f32>,
 ) {
-    let value = reset_at
-        .map(format_remaining)
-        .unwrap_or_else(|| "—".to_string());
-    ui.label(
-        egui::RichText::new(tag)
-            .monospace()
-            .size(11.0)
-            .strong()
-            .color(color),
-    );
-    ui.label(
-        egui::RichText::new(value)
-            .monospace()
-            .size(11.0)
-            .color(MUTED),
-    );
+    ui.horizontal(|ui| {
+        ui.label(label(name, 12.0, MUTED));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            let remaining = reset_at
+                .map(format_remaining)
+                .unwrap_or_else(|| "—".to_string());
+            ui.label(number(remaining, 12.0, TEXT));
+        });
+    });
+    ui.add_space(2.0);
+
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, 3.0), egui::Sense::hover());
+    ui.painter().rect_filled(rect, 1.5, TRACK);
+    if let Some(fraction) = fill {
+        let mut filled = rect;
+        filled.set_width(rect.width() * fraction.clamp(0.0, 1.0));
+        ui.painter().rect_filled(filled, 1.5, color);
+    }
+    ui.add_space(6.0);
+}
+
+/// Both providers report quota consumed as a percentage; the meter wants a
+/// fraction.
+fn used_fill(used_percent: Option<f64>) -> Option<f32> {
+    used_percent.map(|percent| (percent / 100.0) as f32)
+}
+
+/// 24 stacked bars, one per hour of the local day, drawn directly rather than
+/// through a plot widget: at this size axes, gridlines and a legend cost more
+/// pixels than the data they annotate. Hours that haven't happened yet are
+/// left empty instead of plotted as zero.
+fn hourly_chart(ui: &mut egui::Ui, stats: &Stats, height: f32) {
+    let claude = hourly_totals_for(stats, None, Some(Source::Claude));
+    let codex = hourly_totals_for(stats, None, Some(Source::Codex));
+    let current_hour = chrono::Local::now().hour() as usize;
+
+    let peak = (0..24)
+        .map(|hour| claude[hour].total_tokens() + codex[hour].total_tokens())
+        .max()
+        .unwrap_or(0)
+        .max(1) as f32;
+
+    let width = ui.available_width();
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(width, height), egui::Sense::hover());
+    let painter = ui.painter();
+
+    let gap = 2.0;
+    let bar_width = (width - gap * 23.0) / 24.0;
+    for hour in 0..24 {
+        let x = rect.left() + hour as f32 * (bar_width + gap);
+        // A 1px baseline stub keeps the 24-slot grid legible even where an
+        // elapsed hour genuinely had no usage.
+        let baseline = egui::Rect::from_min_size(
+            egui::pos2(x, rect.bottom() - 1.0),
+            egui::vec2(bar_width, 1.0),
+        );
+        painter.rect_filled(baseline, 0.0, TRACK);
+        if hour > current_hour {
+            continue;
+        }
+
+        let mut y = rect.bottom();
+        for (totals, color) in [(&codex[hour], CODEX), (&claude[hour], CLAUDE)] {
+            let value = totals.total_tokens();
+            if value == 0 {
+                continue;
+            }
+            let bar_height = (value as f32 / peak) * (height - 2.0);
+            let segment = egui::Rect::from_min_size(
+                egui::pos2(x, y - bar_height),
+                egui::vec2(bar_width, bar_height),
+            );
+            painter.rect_filled(segment, 1.0, color);
+            y -= bar_height;
+        }
+    }
 }
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.configure_visuals(ui.ctx());
+        self.style(ui.ctx());
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let stats = self.snapshot.lock().unwrap().clone();
-
         let totals = totals_for(&stats, None, None);
-        surface().show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.spacing_mut().item_spacing.x = 5.0;
-                chip(ui, "↑", format_compact(totals.input), IN_COLOR);
-                chip(ui, "↓", format_compact(totals.output), OUT_COLOR);
-                chip(
-                    ui,
-                    "⇄",
-                    format_compact(totals.cache_read + totals.cache_write),
-                    CACHE_COLOR,
-                );
-                ui.separator();
-                reset_chip(ui, "CC", CLAUDE, stats.claude_reset_at());
-                reset_chip(ui, "CX", CODEX, stats.codex_reset_at);
-            });
-            ui.separator();
-            ui.columns(2, |columns| {
-                metric(
-                    &mut columns[0],
-                    "TOTAL TOKENS",
-                    format_int(totals.total_tokens()),
-                    CODEX,
-                    18.0,
-                );
-                metric(
-                    &mut columns[1],
-                    "EST. COST",
-                    format!("${:.2}", totals.cost),
-                    CODEX,
-                    18.0,
-                );
-            });
-        });
 
-        ui.label(
-            egui::RichText::new("LIVE ACTIVITY")
-                .strong()
-                .small()
-                .color(MUTED),
-        );
-        surface().show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .max_height(118.0)
-                .show(ui, |ui| {
-                    if stats.feed.is_empty() {
-                        ui.label(egui::RichText::new("No activity yet").color(MUTED));
-                    }
-                    // Newest first: the scroll area opens at its top by
-                    // default, so the most recent entry is already in view
-                    // with no scrolling, and new entries never get appended
-                    // below the fold.
-                    for entry in stats.feed.iter().rev() {
-                        ui.horizontal(|ui| {
-                            let local_time = entry.ts.with_timezone(&chrono::Local);
-                            ui.label(
-                                egui::RichText::new(local_time.format("%H:%M:%S").to_string())
-                                    .monospace()
-                                    .color(MUTED),
-                            );
-                            ui.label(
-                                egui::RichText::new(Self::source_tag(entry.source))
-                                    .small()
-                                    .strong()
-                                    .color(Self::source_color(entry.source)),
-                            );
-                            ui.label(egui::RichText::new(entry.model.as_str()).small());
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    ui.label(
-                                        egui::RichText::new(format!(
-                                            "{} tok  ${:.4}",
-                                            format_int(entry.tokens),
-                                            entry.cost
-                                        ))
-                                        .monospace()
-                                        .small(),
-                                    );
-                                },
-                            );
+        egui::Frame::new()
+            .inner_margin(egui::Margin::same(MARGIN))
+            .show(ui, |ui| {
+                // Stack the chart up from the bottom edge, then let everything
+                // else fill the slack above it. Splitting the two by hand meant
+                // subtracting a constant, and a wrong constant silently clipped
+                // the caption off the bottom of the window.
+                ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(label("TOKENS / HOUR", 9.0, MUTED));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(label("00:00 – 23:00", 9.0, MUTED));
                         });
-                    }
+                    });
+                    ui.add_space(3.0);
+                    hourly_chart(ui, &stats, CHART_HEIGHT);
+                    ui.add_space(5.0);
+                    divider(ui);
+
+                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                        self.dashboard(ui, &stats, &totals);
+                    });
                 });
+            });
+    }
+}
+
+impl App {
+    /// Everything above the chart: header, hero figure, quota meters, feed.
+    fn dashboard(&self, ui: &mut egui::Ui, stats: &Stats, totals: &crate::model::Totals) {
+        ui.horizontal(|ui| {
+            ui.label(label("Today", 12.0, MUTED));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                live_indicator(ui, stats);
+            });
+        });
+        ui.add_space(3.0);
+
+        // The hero: the one number worth reading from across the room.
+        ui.label(
+            egui::RichText::new(format!("${:.2}", totals.cost))
+                .monospace()
+                .size(28.0)
+                .color(TEXT),
+        );
+        ui.label(label(
+            &format!("{} tokens today", format_int(totals.total_tokens())),
+            11.0,
+            MUTED,
+        ));
+        ui.add_space(5.0);
+        // Spelled out rather than glyphed: an arrow pair is a guessing
+        // game, and the one for cache (⇄) isn't even in the mono face.
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 11.0;
+            for (name, value) in [
+                ("in", totals.input),
+                ("out", totals.output),
+                ("cache", totals.cache_read + totals.cache_write),
+            ] {
+                ui.label(number(
+                    format!("{name} {}", format_compact(value)),
+                    11.0,
+                    MUTED,
+                ));
+            }
         });
 
-        ui.label(
-            egui::RichText::new("TOKENS / HOUR")
-                .strong()
-                .small()
-                .color(MUTED),
+        divider(ui);
+        heading(ui, "QUOTA");
+        reset_row(
+            ui,
+            "Claude · session",
+            CLAUDE,
+            stats.claude_reset_at(),
+            used_fill(stats.claude_quota.five_hour.map(|w| w.utilization)),
         );
-        let claude_hours = hourly_totals_for(&stats, None, Some(Source::Claude));
-        let codex_hours = hourly_totals_for(&stats, None, Some(Source::Codex));
-        // Only elapsed hours carry real data; a 0..24 line chart made the
-        // still-to-come hours look like usage crashing to zero. Bars over
-        // 0..=now represent each hour's discrete total instead of a
-        // misleading interpolated trend.
-        let current_hour = chrono::Local::now().hour() as usize;
-        let claude_bars: Vec<Bar> = (0..=current_hour)
-            .map(|hour| {
-                Bar::new(hour as f64 - 0.19, claude_hours[hour].total_tokens() as f64).width(0.38)
-            })
-            .collect();
-        let codex_bars: Vec<Bar> = (0..=current_hour)
-            .map(|hour| {
-                Bar::new(hour as f64 + 0.19, codex_hours[hour].total_tokens() as f64).width(0.38)
-            })
-            .collect();
-        surface().show(ui, |ui| {
-            Plot::new("hourly_chart")
-                .height(88.0)
-                .show_axes([true, false])
-                .show_grid([false, false])
-                .allow_zoom(false)
-                .allow_drag(false)
-                .allow_scroll(false)
-                .include_x(0.0)
-                .include_x(23.0)
-                .legend(Legend::default())
-                .show(ui, |plot_ui| {
-                    plot_ui.bar_chart(BarChart::new("Claude Code", claude_bars).color(CLAUDE));
-                    plot_ui.bar_chart(BarChart::new("Codex", codex_bars).color(CODEX));
-                });
-        });
+        reset_row(
+            ui,
+            "Claude · week",
+            CLAUDE,
+            stats.claude_weekly_reset_at(),
+            used_fill(stats.claude_quota.seven_day.map(|w| w.utilization)),
+        );
+        reset_row(
+            ui,
+            "Codex",
+            CODEX,
+            stats.codex_reset_at,
+            used_fill(stats.codex_used_percent),
+        );
+
+        divider(ui);
+        heading(ui, "ACTIVITY");
+        // The chart below already claimed its space, so whatever is
+        // left here is exactly the feed's.
+        activity_feed(ui, stats, ui.available_height());
     }
+}
+
+/// Pulses while usage is still arriving, so the window reads as live rather
+/// than as a screenshot of a number.
+fn live_indicator(ui: &mut egui::Ui, stats: &Stats) {
+    let last = stats.feed.back().map(|entry| entry.ts);
+    let active = last.is_some_and(|ts| (chrono::Utc::now() - ts).num_seconds() < 120);
+
+    let (text, color) = if active {
+        let phase = ui.input(|i| i.time) as f32 * 1.6;
+        let alpha = 0.45 + 0.55 * (0.5 + 0.5 * phase.sin());
+        ("live", TEXT.gamma_multiply(alpha))
+    } else {
+        ("idle", MUTED.gamma_multiply(0.7))
+    };
+
+    ui.label(label(text, 10.0, MUTED));
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(6.0, 6.0), egui::Sense::hover());
+    ui.painter().circle_filled(rect.center(), 3.0, color);
+}
+
+/// Fixed so the feed can be sized to a whole number of rows. A scroll area
+/// that ends mid-row shows a sliced-off line of text, which is exactly the
+/// kind of detail that makes a window look unfinished.
+const FEED_ROW: f32 = 22.0;
+
+fn activity_feed(ui: &mut egui::Ui, stats: &Stats, available: f32) {
+    let height = (available / FEED_ROW).floor() * FEED_ROW;
+    egui::ScrollArea::vertical()
+        .max_height(height)
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            // Rows must pitch at exactly FEED_ROW for the flooring above to
+            // land on a row boundary; any vertical item spacing would add to
+            // each row's height and put a sliced row back at the bottom.
+            ui.spacing_mut().item_spacing.y = 0.0;
+            if stats.feed.is_empty() {
+                ui.label(label("Waiting for activity…", 11.0, MUTED));
+                return;
+            }
+            // Newest first: the scroll area opens at its top, so the most
+            // recent entry is in view without scrolling.
+            for entry in stats.feed.iter().rev() {
+                let row = egui::vec2(ui.available_width(), FEED_ROW);
+                ui.allocate_ui(row, |ui| {
+                    ui.horizontal_centered(|ui| {
+                        ui.spacing_mut().item_spacing.x = 7.0;
+                        let local_time = entry.ts.with_timezone(&chrono::Local);
+                        ui.label(number(local_time.format("%H:%M").to_string(), 11.0, MUTED));
+
+                        // The source is encoded in this 2px rule rather than a
+                        // "CC"/"CX" tag: it reads instantly and costs no width.
+                        let (rule, _) =
+                            ui.allocate_exact_size(egui::vec2(2.0, 12.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rule, 1.0, App::source_color(entry.source));
+
+                        ui.label(label(short_model(&entry.model), 11.0, TEXT));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.spacing_mut().item_spacing.x = 6.0;
+                            ui.label(number(format!("${:.3}", entry.cost), 11.0, MUTED));
+                            ui.label(number(format_compact(entry.tokens), 11.0, TEXT));
+                        });
+                    });
+                });
+            }
+        });
+}
+
+/// Vendor prefixes are redundant once the source rule is colored, and they
+/// push the model name into the token column on a 360px window.
+fn short_model(model: &str) -> &str {
+    model
+        .strip_prefix("claude-")
+        .or_else(|| model.strip_prefix("anthropic/"))
+        .unwrap_or(model)
 }
 
 #[cfg(test)]
@@ -339,5 +466,11 @@ mod tests {
         assert_eq!(format_compact(537_819), "537.8K");
         assert_eq!(format_compact(7_832_248), "7.83M");
         assert_eq!(format_compact(1_500_000_000), "1.50B");
+    }
+
+    #[test]
+    fn short_model_strips_only_vendor_prefixes() {
+        assert_eq!(short_model("claude-opus-4-8"), "opus-4-8");
+        assert_eq!(short_model("gpt-5.5"), "gpt-5.5");
     }
 }

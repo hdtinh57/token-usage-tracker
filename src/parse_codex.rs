@@ -3,6 +3,13 @@ use serde_json::Value;
 
 use crate::model::{Source, UsageEvent};
 
+/// One `rate_limits` window exactly as Codex logged it.
+#[derive(Debug, Clone, Copy)]
+struct RateWindow {
+    resets_at: DateTime<Utc>,
+    used_percent: Option<f64>,
+}
+
 #[derive(Default)]
 pub struct CodexSessionParser {
     current_model: Option<String>,
@@ -40,6 +47,7 @@ impl CodexSessionParser {
         let get_u64 = |field: &str| last.get(field).and_then(|x| x.as_u64()).unwrap_or(0);
 
         let cache_read = get_u64("cached_input_tokens");
+        let soonest = Self::soonest_window(payload);
         Some(UsageEvent {
             ts,
             source: Source::Codex,
@@ -50,20 +58,30 @@ impl CodexSessionParser {
             output: get_u64("output_tokens"),
             cache_read,
             cache_write: 0,
-            reset_at: Self::soonest_reset(payload),
+            reset_at: soonest.map(|window| window.resets_at),
+            reset_used_percent: soonest.and_then(|window| window.used_percent),
         })
     }
 
     /// Codex reports both a short session window and a longer weekly one
     /// under `rate_limits.primary`/`.secondary`; surface whichever resets
     /// first since that is the one that actually blocks the next request.
-    fn soonest_reset(payload: &Value) -> Option<DateTime<Utc>> {
+    ///
+    /// Unlike Claude, these are the server's own numbers — Codex writes the
+    /// rate-limit snapshot the API returned straight into the rollout log — so
+    /// they are taken as-is, never inferred from event timestamps.
+    fn soonest_window(payload: &Value) -> Option<RateWindow> {
         let rate_limits = payload.get("rate_limits")?;
         ["primary", "secondary"]
             .iter()
-            .filter_map(|window| rate_limits.get(window)?.get("resets_at")?.as_i64())
-            .filter_map(|epoch| DateTime::from_timestamp(epoch, 0))
-            .min()
+            .filter_map(|name| {
+                let window = rate_limits.get(name)?;
+                Some(RateWindow {
+                    resets_at: DateTime::from_timestamp(window.get("resets_at")?.as_i64()?, 0)?,
+                    used_percent: window.get("used_percent").and_then(|p| p.as_f64()),
+                })
+            })
+            .min_by_key(|window| window.resets_at)
     }
 }
 
@@ -116,6 +134,29 @@ mod tests {
         assert_eq!(sum_output, 30);
         assert_eq!(sum_cache, 15);
         assert_eq!(sum_input + sum_cache + sum_output, 180);
+    }
+
+    #[test]
+    fn soonest_window_reports_the_usage_of_the_limit_that_resets_first() {
+        // Shape copied from a real rollout log: the secondary window resets
+        // sooner here, so its `used_percent` — not the primary's 51% — is the
+        // one that describes the limit about to bite.
+        const WITH_LIMITS: &str = r#"{"timestamp":"2026-07-13T10:00:05.000Z","type":"event_msg","payload":{"type":"token_count","info":{"last_token_usage":{"input_tokens":100,"cached_input_tokens":10,"output_tokens":20,"total_tokens":120}},"rate_limits":{"primary":{"used_percent":51.0,"window_minutes":10080,"resets_at":2000000000},"secondary":{"used_percent":8.0,"window_minutes":300,"resets_at":1900000000}}}}"#;
+
+        let mut p = CodexSessionParser::default();
+        p.process_line(TURN_CONTEXT);
+        let ev = p.process_line(WITH_LIMITS).expect("should parse");
+        assert_eq!(ev.reset_at, DateTime::from_timestamp(1_900_000_000, 0));
+        assert_eq!(ev.reset_used_percent, Some(8.0));
+    }
+
+    #[test]
+    fn missing_rate_limits_leaves_both_reset_fields_empty() {
+        let mut p = CodexSessionParser::default();
+        p.process_line(TURN_CONTEXT);
+        let ev = p.process_line(TOKEN_COUNT_1).expect("should parse");
+        assert_eq!(ev.reset_at, None);
+        assert_eq!(ev.reset_used_percent, None);
     }
 
     #[test]

@@ -31,6 +31,7 @@ fn parse_value(v: &Value) -> Option<UsageEvent> {
         cache_read: get_u64("cache_read_input_tokens"),
         cache_write: get_u64("cache_creation_input_tokens"),
         reset_at: None,
+        reset_used_percent: None,
     })
 }
 

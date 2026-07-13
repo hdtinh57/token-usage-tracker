@@ -1,11 +1,11 @@
 [package]
 name = "token-tracker"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 
 [dependencies]
-chrono = "0.4.45"
+chrono = { version = "0.4.45", features = ["serde"] }
 eframe = "0.35.0"
-egui_plot = "0.36.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+ureq = { version = "3", default-features = false, features = ["rustls", "json", "gzip"] }

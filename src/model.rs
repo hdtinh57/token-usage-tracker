@@ -3,6 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use chrono::NaiveDate;
 
 use crate::pricing::PricingTable;
+use crate::quota::ClaudeQuota;
 
 pub const FEED_CAPACITY: usize = 20;
 
@@ -25,6 +26,10 @@ pub struct UsageEvent {
     /// event (Codex reports it directly; Claude has no such field so this is
     /// always `None` there — Claude's reset is inferred from event spacing).
     pub reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Percent of that window's quota already consumed, 0–100, as the provider
+    /// reported it (Codex ships this on every event; Claude's comes from
+    /// `crate::quota` instead). `None` where unreported.
+    pub reset_used_percent: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -70,11 +75,6 @@ pub struct FeedEntry {
     pub cost: f64,
 }
 
-/// Claude reports no rate-limit data, so its reset is inferred the way
-/// ccusage-style trackers do: a "block" starts at the first event after a
-/// 5h+ gap and resets 5h after that.
-pub const CLAUDE_SESSION_HOURS: i64 = 5;
-
 #[derive(Debug, Clone)]
 pub struct Stats {
     pub current_day: NaiveDate,
@@ -88,9 +88,12 @@ pub struct Stats {
     /// Quota state, like the feed, is real-time account state rather than a
     /// today-scoped aggregate, so it also survives day rollover.
     pub codex_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub codex_used_percent: Option<f64>,
     codex_last_event: Option<chrono::DateTime<chrono::Utc>>,
-    pub claude_block_start: Option<chrono::DateTime<chrono::Utc>>,
-    claude_last_event: Option<chrono::DateTime<chrono::Utc>>,
+    /// Reported by the account, not derived from events. `Default` (both
+    /// windows `None`) until the first successful poll, and left at the last
+    /// good reading if a later poll fails.
+    pub claude_quota: ClaudeQuota,
 }
 
 impl Stats {
@@ -102,16 +105,20 @@ impl Stats {
             unknown_pricing_models: HashSet::new(),
             feed: VecDeque::new(),
             codex_reset_at: None,
+            codex_used_percent: None,
             codex_last_event: None,
-            claude_block_start: None,
-            claude_last_event: None,
+            claude_quota: ClaudeQuota::default(),
         }
     }
 
-    /// When the current Claude 5h block resets, if a block is active.
+    /// When the current Claude 5h session window resets, as the account reports it.
     pub fn claude_reset_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
-        self.claude_block_start
-            .map(|start| start + chrono::Duration::hours(CLAUDE_SESSION_HOURS))
+        self.claude_quota.five_hour.map(|window| window.resets_at)
+    }
+
+    /// When the current Claude 7-day window resets, as the account reports it.
+    pub fn claude_weekly_reset_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.claude_quota.seven_day.map(|window| window.resets_at)
     }
 
     pub fn rollover_if_needed(&mut self, today: NaiveDate) {
@@ -143,29 +150,19 @@ impl Stats {
         }
     }
 
+    /// Only Codex's quota comes from events — it ships `resets_at` on each
+    /// one. Claude's arrives out-of-band, from `crate::quota`.
     fn track_quota(&mut self, ev: &UsageEvent) {
-        match ev.source {
-            Source::Codex => {
-                // Startup scans files independently, so ingestion order is
-                // not event-time order. Only the newest event can describe
-                // the current account quota.
-                if self.codex_last_event.is_none_or(|last| ev.ts > last) {
-                    self.codex_last_event = Some(ev.ts);
-                    self.codex_reset_at = ev.reset_at;
-                }
-            }
-            Source::Claude => {
-                if self.claude_last_event.is_some_and(|last| ev.ts <= last) {
-                    return;
-                }
-                let gap_exceeded = self.claude_last_event.is_none_or(|last| {
-                    ev.ts - last > chrono::Duration::hours(CLAUDE_SESSION_HOURS)
-                });
-                if gap_exceeded {
-                    self.claude_block_start = Some(ev.ts);
-                }
-                self.claude_last_event = Some(ev.ts);
-            }
+        if ev.source != Source::Codex {
+            return;
+        }
+        // Startup scans files independently, so ingestion order is not
+        // event-time order. Only the newest event can describe the current
+        // account quota.
+        if self.codex_last_event.is_none_or(|last| ev.ts > last) {
+            self.codex_last_event = Some(ev.ts);
+            self.codex_reset_at = ev.reset_at;
+            self.codex_used_percent = ev.reset_used_percent;
         }
     }
 }
@@ -292,6 +289,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reset_at: None,
+            reset_used_percent: None,
         }
     }
 
@@ -347,6 +345,7 @@ mod tests {
             cache_read: 0,
             cache_write: 0,
             reset_at: None,
+            reset_used_percent: None,
         }
     }
 
@@ -579,32 +578,18 @@ mod tests {
     }
 
     #[test]
-    fn claude_reset_at_starts_a_new_5h_block_after_a_gap_and_extends_within_one() {
+    fn claude_events_do_not_move_the_quota_window() {
+        // Claude's window is server-side state fetched from the account; no
+        // amount of local event traffic may invent or shift it.
         let today = chrono::Local::now().date_naive();
         let mut stats = Stats::new(today);
-        let first = event_on(today, 9, Source::Claude, "claude-sonnet-4-6", 1);
-        ingest_event(&mut stats, &first, &table_with_sonnet());
-        let first_reset = stats.claude_reset_at().unwrap();
-        assert_eq!(
-            first_reset,
-            first.ts + chrono::Duration::hours(CLAUDE_SESSION_HOURS)
+        ingest_event(
+            &mut stats,
+            &event_on(today, 9, Source::Claude, "claude-sonnet-4-6", 1),
+            &table_with_sonnet(),
         );
-
-        // Still inside the block: reset time doesn't move.
-        let mut within_block = first.clone();
-        within_block.ts += chrono::Duration::hours(2);
-        ingest_event(&mut stats, &within_block, &table_with_sonnet());
-        assert_eq!(stats.claude_reset_at().unwrap(), first_reset);
-
-        // Gap over 5h since the *last* event (within_block, not first):
-        // a new block starts from this event.
-        let mut after_gap = within_block.clone();
-        after_gap.ts += chrono::Duration::hours(6);
-        ingest_event(&mut stats, &after_gap, &table_with_sonnet());
-        assert_eq!(
-            stats.claude_reset_at().unwrap(),
-            after_gap.ts + chrono::Duration::hours(CLAUDE_SESSION_HOURS)
-        );
+        assert!(stats.claude_reset_at().is_none());
+        assert!(stats.claude_weekly_reset_at().is_none());
     }
 
     #[test]
