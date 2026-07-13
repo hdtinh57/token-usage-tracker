@@ -34,12 +34,14 @@ pub fn collect_mtimes(paths: &[PathBuf]) -> Vec<(PathBuf, SystemTime)> {
         .collect()
 }
 
-pub fn select_active(entries: &[(PathBuf, SystemTime)], within: Duration, now: SystemTime) -> Vec<PathBuf> {
+pub fn select_active(
+    entries: &[(PathBuf, SystemTime)],
+    within: Duration,
+    now: SystemTime,
+) -> Vec<PathBuf> {
     entries
         .iter()
-        .filter(|(_, mtime)| {
-            now.duration_since(*mtime).unwrap_or(Duration::ZERO) <= within
-        })
+        .filter(|(_, mtime)| now.duration_since(*mtime).unwrap_or(Duration::ZERO) <= within)
         .map(|(p, _)| p.clone())
         .collect()
 }
@@ -102,7 +104,7 @@ mod tests {
         let root = temp_dir("mtimes");
         let file = root.join("a.jsonl");
         std::fs::write(&file, b"{}").unwrap();
-        let mtimes = collect_mtimes(&[file.clone()]);
+        let mtimes = collect_mtimes(std::slice::from_ref(&file));
         assert_eq!(mtimes.len(), 1);
         assert_eq!(mtimes[0].0, file);
         let age = SystemTime::now()

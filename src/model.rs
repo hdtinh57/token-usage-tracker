@@ -21,6 +21,10 @@ pub struct UsageEvent {
     pub output: u64,
     pub cache_read: u64,
     pub cache_write: u64,
+    /// Soonest account-level quota reset the provider reported alongside this
+    /// event (Codex reports it directly; Claude has no such field so this is
+    /// always `None` there — Claude's reset is inferred from event spacing).
+    pub reset_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -66,6 +70,11 @@ pub struct FeedEntry {
     pub cost: f64,
 }
 
+/// Claude reports no rate-limit data, so its reset is inferred the way
+/// ccusage-style trackers do: a "block" starts at the first event after a
+/// 5h+ gap and resets 5h after that.
+pub const CLAUDE_SESSION_HOURS: i64 = 5;
+
 #[derive(Debug, Clone)]
 pub struct Stats {
     pub current_day: NaiveDate,
@@ -76,6 +85,12 @@ pub struct Stats {
     /// Not cleared on day rollover: this is a live activity feed, not a
     /// today-scoped aggregate, so it keeps rolling across midnight.
     pub feed: VecDeque<FeedEntry>,
+    /// Quota state, like the feed, is real-time account state rather than a
+    /// today-scoped aggregate, so it also survives day rollover.
+    pub codex_reset_at: Option<chrono::DateTime<chrono::Utc>>,
+    codex_last_event: Option<chrono::DateTime<chrono::Utc>>,
+    pub claude_block_start: Option<chrono::DateTime<chrono::Utc>>,
+    claude_last_event: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl Stats {
@@ -86,7 +101,17 @@ impl Stats {
             by_hour: HashMap::new(),
             unknown_pricing_models: HashSet::new(),
             feed: VecDeque::new(),
+            codex_reset_at: None,
+            codex_last_event: None,
+            claude_block_start: None,
+            claude_last_event: None,
         }
+    }
+
+    /// When the current Claude 5h block resets, if a block is active.
+    pub fn claude_reset_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.claude_block_start
+            .map(|start| start + chrono::Duration::hours(CLAUDE_SESSION_HOURS))
     }
 
     pub fn rollover_if_needed(&mut self, today: NaiveDate) {
@@ -98,22 +123,49 @@ impl Stats {
         }
     }
 
-    pub fn model_keys(&self) -> Vec<(Source, String)> {
-        let mut keys: Vec<(Source, String)> = self.by_model.keys().cloned().collect();
-        keys.sort_by(|a, b| a.1.cmp(&b.1));
-        keys
-    }
-
     fn push_feed(&mut self, ev: &UsageEvent, cost: f64) {
-        self.feed.push_back(FeedEntry {
+        let entry = FeedEntry {
             ts: ev.ts,
             source: ev.source,
             model: ev.model.clone(),
             tokens: ev.input + ev.output + ev.cache_read + ev.cache_write,
             cost,
-        });
+        };
+        // Events arrive file-by-file (all of one session's lines, then the
+        // next), not merged by timestamp, so a plain push_back+cap let a
+        // single high-volume source's file flood the last N slots and evict
+        // every entry from the other source. Insert by timestamp instead so
+        // the cap always keeps the truly most-recent events across sources.
+        let pos = self.feed.partition_point(|e| e.ts <= entry.ts);
+        self.feed.insert(pos, entry);
         while self.feed.len() > FEED_CAPACITY {
             self.feed.pop_front();
+        }
+    }
+
+    fn track_quota(&mut self, ev: &UsageEvent) {
+        match ev.source {
+            Source::Codex => {
+                // Startup scans files independently, so ingestion order is
+                // not event-time order. Only the newest event can describe
+                // the current account quota.
+                if self.codex_last_event.is_none_or(|last| ev.ts > last) {
+                    self.codex_last_event = Some(ev.ts);
+                    self.codex_reset_at = ev.reset_at;
+                }
+            }
+            Source::Claude => {
+                if self.claude_last_event.is_some_and(|last| ev.ts <= last) {
+                    return;
+                }
+                let gap_exceeded = self.claude_last_event.is_none_or(|last| {
+                    ev.ts - last > chrono::Duration::hours(CLAUDE_SESSION_HOURS)
+                });
+                if gap_exceeded {
+                    self.claude_block_start = Some(ev.ts);
+                }
+                self.claude_last_event = Some(ev.ts);
+            }
         }
     }
 }
@@ -126,9 +178,11 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
         ),
         None => (0.0, true),
     };
-    // Feed is a live activity view, not a today-scoped aggregate: every
-    // successfully parsed event lands here regardless of the day filter below.
+    // Feed and quota state are live-account views, not today-scoped
+    // aggregates: they update from every parsed event regardless of the day
+    // filter below.
     stats.push_feed(ev, cost_delta);
+    stats.track_quota(ev);
 
     let local_ts = ev.ts.with_timezone(&chrono::Local);
     if local_ts.date_naive() != stats.current_day {
@@ -224,8 +278,8 @@ impl HourIndex for chrono::DateTime<chrono::Local> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{NaiveDate, TimeZone, Utc};
     use crate::pricing::{Price, PricingTable};
+    use chrono::{NaiveDate, TimeZone, Utc};
     use std::collections::HashMap;
 
     fn ev(input: u64, output: u64) -> UsageEvent {
@@ -237,6 +291,7 @@ mod tests {
             output,
             cache_read: 0,
             cache_write: 0,
+            reset_at: None,
         }
     }
 
@@ -266,11 +321,13 @@ mod tests {
 
     #[test]
     fn total_tokens_sums_all_four_components() {
-        let mut t = Totals::default();
-        t.input = 1;
-        t.output = 2;
-        t.cache_read = 3;
-        t.cache_write = 4;
+        let t = Totals {
+            input: 1,
+            output: 2,
+            cache_read: 3,
+            cache_write: 4,
+            ..Default::default()
+        };
         assert_eq!(t.total_tokens(), 10);
     }
 
@@ -281,12 +338,29 @@ mod tests {
             .from_local_datetime(&date.and_hms_opt(hour, 0, 0).unwrap())
             .unwrap()
             .with_timezone(&Utc);
-        UsageEvent { ts, source, model: model.to_string(), input, output: 0, cache_read: 0, cache_write: 0 }
+        UsageEvent {
+            ts,
+            source,
+            model: model.to_string(),
+            input,
+            output: 0,
+            cache_read: 0,
+            cache_write: 0,
+            reset_at: None,
+        }
     }
 
     fn table_with_sonnet() -> PricingTable {
         let mut m = HashMap::new();
-        m.insert("claude-sonnet-4".to_string(), Price { input: 1.0, output: 1.0, cache_read: 1.0, cache_write: 1.0 });
+        m.insert(
+            "claude-sonnet-4".to_string(),
+            Price {
+                input: 1.0,
+                output: 1.0,
+                cache_read: 1.0,
+                cache_write: 1.0,
+            },
+        );
         PricingTable::from_map(m)
     }
 
@@ -306,7 +380,13 @@ mod tests {
         let today = chrono::Local::now().date_naive();
         let yesterday = today.pred_opt().unwrap();
         let mut stats = Stats::new(today);
-        let ev = event_on(yesterday, 10, Source::Claude, "claude-sonnet-4-6", 1_000_000);
+        let ev = event_on(
+            yesterday,
+            10,
+            Source::Claude,
+            "claude-sonnet-4-6",
+            1_000_000,
+        );
         ingest_event(&mut stats, &ev, &table_with_sonnet());
         assert_eq!(totals_for(&stats, None, None).input, 0);
     }
@@ -347,20 +427,35 @@ mod tests {
         let t = totals_for(&stats, None, None);
         assert_eq!(t.input, 100);
         assert_eq!(t.cost, 0.0);
-        assert!(stats.unknown_pricing_models.contains("some-brand-new-model"));
+        assert!(
+            stats
+                .unknown_pricing_models
+                .contains("some-brand-new-model")
+        );
     }
 
     #[test]
     fn totals_for_filters_by_model_and_source_independently() {
         let today = chrono::Local::now().date_naive();
         let mut stats = Stats::new(today);
-        ingest_event(&mut stats, &event_on(today, 1, Source::Claude, "claude-sonnet-4-6", 100), &table_with_sonnet());
-        ingest_event(&mut stats, &event_on(today, 2, Source::Codex, "gpt-5.5", 200), &table_with_sonnet());
+        ingest_event(
+            &mut stats,
+            &event_on(today, 1, Source::Claude, "claude-sonnet-4-6", 100),
+            &table_with_sonnet(),
+        );
+        ingest_event(
+            &mut stats,
+            &event_on(today, 2, Source::Codex, "gpt-5.5", 200),
+            &table_with_sonnet(),
+        );
 
         assert_eq!(totals_for(&stats, None, None).input, 300);
         assert_eq!(totals_for(&stats, None, Some(Source::Claude)).input, 100);
         assert_eq!(totals_for(&stats, None, Some(Source::Codex)).input, 200);
-        assert_eq!(totals_for(&stats, Some("claude-sonnet-4-6"), None).input, 100);
+        assert_eq!(
+            totals_for(&stats, Some("claude-sonnet-4-6"), None).input,
+            100
+        );
         assert_eq!(totals_for(&stats, Some("gpt-5.5"), None).input, 200);
     }
 
@@ -368,9 +463,21 @@ mod tests {
     fn hourly_totals_for_buckets_by_local_hour_and_respects_filters() {
         let today = chrono::Local::now().date_naive();
         let mut stats = Stats::new(today);
-        ingest_event(&mut stats, &event_on(today, 3, Source::Claude, "claude-sonnet-4-6", 100), &table_with_sonnet());
-        ingest_event(&mut stats, &event_on(today, 3, Source::Codex, "gpt-5.5", 50), &table_with_sonnet());
-        ingest_event(&mut stats, &event_on(today, 9, Source::Claude, "claude-sonnet-4-6", 7), &table_with_sonnet());
+        ingest_event(
+            &mut stats,
+            &event_on(today, 3, Source::Claude, "claude-sonnet-4-6", 100),
+            &table_with_sonnet(),
+        );
+        ingest_event(
+            &mut stats,
+            &event_on(today, 3, Source::Codex, "gpt-5.5", 50),
+            &table_with_sonnet(),
+        );
+        ingest_event(
+            &mut stats,
+            &event_on(today, 9, Source::Claude, "claude-sonnet-4-6", 7),
+            &table_with_sonnet(),
+        );
 
         let all = hourly_totals_for(&stats, None, None);
         assert_eq!(all[3].input, 150);
@@ -386,11 +493,23 @@ mod tests {
     fn reprice_updates_cost_for_by_model_and_by_hour_from_stored_token_components() {
         let today = chrono::Local::now().date_naive();
         let mut stats = Stats::new(today);
-        ingest_event(&mut stats, &event_on(today, 5, Source::Claude, "claude-sonnet-4-6", 1_000_000), &table_with_sonnet());
+        ingest_event(
+            &mut stats,
+            &event_on(today, 5, Source::Claude, "claude-sonnet-4-6", 1_000_000),
+            &table_with_sonnet(),
+        );
         assert!((totals_for(&stats, None, None).cost - 1.0).abs() < 1e-9);
 
         let mut m = HashMap::new();
-        m.insert("claude-sonnet-4".to_string(), Price { input: 2.0, output: 2.0, cache_read: 2.0, cache_write: 2.0 });
+        m.insert(
+            "claude-sonnet-4".to_string(),
+            Price {
+                input: 2.0,
+                output: 2.0,
+                cache_read: 2.0,
+                cache_write: 2.0,
+            },
+        );
         let new_pricing = PricingTable::from_map(m);
         reprice(&mut stats, &new_pricing);
 
@@ -428,5 +547,88 @@ mod tests {
         assert_eq!(totals_for(&stats, None, None).input, 0); // not in today's aggregate
         assert_eq!(stats.feed.len(), 1); // but visible in the live feed
         assert_eq!(stats.feed.back().unwrap().tokens, 42);
+    }
+
+    #[test]
+    fn feed_stays_time_ordered_even_when_ingested_out_of_order() {
+        // Regression: events are ingested file-by-file (all of one session's
+        // lines, then the next), not merged by timestamp across sources. A
+        // plain push_back+cap let a later-ingested but earlier-timestamped
+        // batch evict the true most-recent entries. Feed order must reflect
+        // event time, not ingestion order.
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        ingest_event(
+            &mut stats,
+            &event_on(today, 11, Source::Claude, "claude-sonnet-4-6", 300),
+            &table_with_sonnet(),
+        );
+        ingest_event(
+            &mut stats,
+            &event_on(today, 9, Source::Codex, "gpt-5.5", 100),
+            &table_with_sonnet(),
+        );
+        ingest_event(
+            &mut stats,
+            &event_on(today, 10, Source::Codex, "gpt-5.5", 200),
+            &table_with_sonnet(),
+        );
+
+        let ordered: Vec<u64> = stats.feed.iter().map(|e| e.tokens).collect();
+        assert_eq!(ordered, vec![100, 200, 300]);
+    }
+
+    #[test]
+    fn claude_reset_at_starts_a_new_5h_block_after_a_gap_and_extends_within_one() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        let first = event_on(today, 9, Source::Claude, "claude-sonnet-4-6", 1);
+        ingest_event(&mut stats, &first, &table_with_sonnet());
+        let first_reset = stats.claude_reset_at().unwrap();
+        assert_eq!(
+            first_reset,
+            first.ts + chrono::Duration::hours(CLAUDE_SESSION_HOURS)
+        );
+
+        // Still inside the block: reset time doesn't move.
+        let mut within_block = first.clone();
+        within_block.ts += chrono::Duration::hours(2);
+        ingest_event(&mut stats, &within_block, &table_with_sonnet());
+        assert_eq!(stats.claude_reset_at().unwrap(), first_reset);
+
+        // Gap over 5h since the *last* event (within_block, not first):
+        // a new block starts from this event.
+        let mut after_gap = within_block.clone();
+        after_gap.ts += chrono::Duration::hours(6);
+        ingest_event(&mut stats, &after_gap, &table_with_sonnet());
+        assert_eq!(
+            stats.claude_reset_at().unwrap(),
+            after_gap.ts + chrono::Duration::hours(CLAUDE_SESSION_HOURS)
+        );
+    }
+
+    #[test]
+    fn codex_reset_at_tracks_the_soonest_reported_reset() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        let mut ev = event_on(today, 9, Source::Codex, "gpt-5.5", 1);
+        let reset = Utc::now() + chrono::Duration::hours(3);
+        ev.reset_at = Some(reset);
+        ingest_event(&mut stats, &ev, &table_with_sonnet());
+        assert_eq!(stats.codex_reset_at, Some(reset));
+    }
+
+    #[test]
+    fn quota_state_uses_the_newest_event_not_ingestion_order() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        let mut newest = event_on(today, 10, Source::Codex, "gpt-5.5", 1);
+        newest.reset_at = Some(Utc::now() + chrono::Duration::hours(2));
+        let mut older = event_on(today, 9, Source::Codex, "gpt-5.5", 1);
+        older.reset_at = Some(Utc::now() + chrono::Duration::hours(1));
+
+        ingest_event(&mut stats, &newest, &table_with_sonnet());
+        ingest_event(&mut stats, &older, &table_with_sonnet());
+        assert_eq!(stats.codex_reset_at, newest.reset_at);
     }
 }

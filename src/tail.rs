@@ -6,7 +6,9 @@ pub struct LineSplitter {
 
 impl LineSplitter {
     pub fn new() -> Self {
-        LineSplitter { leftover: Vec::new() }
+        LineSplitter {
+            leftover: Vec::new(),
+        }
     }
 
     pub fn feed(&mut self, chunk: &[u8]) -> Vec<String> {
@@ -48,13 +50,18 @@ pub struct Tailer {
 
 impl Tailer {
     pub fn new() -> Self {
-        Tailer { files: HashMap::new() }
+        Tailer {
+            files: HashMap::new(),
+        }
     }
 
     pub fn prime(&mut self, path: &Path, offset: u64) {
         self.files.insert(
             path.to_path_buf(),
-            FileTailState { offset, splitter: LineSplitter::new() },
+            FileTailState {
+                offset,
+                splitter: LineSplitter::new(),
+            },
         );
     }
 
@@ -70,7 +77,10 @@ impl Tailer {
         let state = self
             .files
             .entry(path.to_path_buf())
-            .or_insert_with(|| FileTailState { offset: 0, splitter: LineSplitter::new() });
+            .or_insert_with(|| FileTailState {
+                offset: 0,
+                splitter: LineSplitter::new(),
+            });
 
         if current_size < state.offset {
             eprintln!(
@@ -119,7 +129,10 @@ mod tests {
     fn feed_with_multiple_lines_in_one_chunk_yields_all() {
         let mut s = LineSplitter::new();
         let lines = s.feed(b"a\nb\nc\n");
-        assert_eq!(lines, vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(
+            lines,
+            vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
     }
 
     #[test]
@@ -179,7 +192,10 @@ mod tailer_tests {
         let first = t.poll(&path).unwrap();
         assert_eq!(first, vec!["line1".to_string(), "line2".to_string()]);
 
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"line3\n").unwrap();
         drop(f);
 
@@ -215,7 +231,10 @@ mod tailer_tests {
         assert!(after_truncate.is_empty() || after_truncate == vec!["short".to_string()]);
 
         // Subsequent appends must be picked up normally from the corrected offset.
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"next\n").unwrap();
         drop(f);
         let after_append = t.poll(&path).unwrap();
@@ -245,9 +264,15 @@ mod tailer_tests {
         let mut t = Tailer::new();
         t.prime(&path, size);
         let lines = t.poll(&path).unwrap();
-        assert!(lines.is_empty(), "primed offset must skip pre-existing content");
+        assert!(
+            lines.is_empty(),
+            "primed offset must skip pre-existing content"
+        );
 
-        let mut f = std::fs::OpenOptions::new().append(true).open(&path).unwrap();
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
         f.write_all(b"new-line\n").unwrap();
         drop(f);
         let lines2 = t.poll(&path).unwrap();

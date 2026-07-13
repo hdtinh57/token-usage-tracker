@@ -11,7 +11,13 @@ pub struct Price {
 }
 
 impl Price {
-    pub fn cost_for_tokens(&self, input: u64, output: u64, cache_read: u64, cache_write: u64) -> f64 {
+    pub fn cost_for_tokens(
+        &self,
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+    ) -> f64 {
         input as f64 / 1_000_000.0 * self.input
             + output as f64 / 1_000_000.0 * self.output
             + cache_read as f64 / 1_000_000.0 * self.cache_read
@@ -58,11 +64,21 @@ mod tests {
         let mut prices = HashMap::new();
         prices.insert(
             "claude-sonnet-4".to_string(),
-            Price { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 },
+            Price {
+                input: 3.0,
+                output: 15.0,
+                cache_read: 0.3,
+                cache_write: 3.75,
+            },
         );
         prices.insert(
             "gpt-5".to_string(),
-            Price { input: 5.0, output: 15.0, cache_read: 0.5, cache_write: 5.0 },
+            Price {
+                input: 5.0,
+                output: 15.0,
+                cache_read: 0.5,
+                cache_write: 5.0,
+            },
         );
         PricingTable::from_map(prices)
     }
@@ -85,7 +101,12 @@ mod tests {
 
     #[test]
     fn cost_for_tokens_computes_expected_dollars() {
-        let price = Price { input: 3.0, output: 15.0, cache_read: 0.3, cache_write: 3.75 };
+        let price = Price {
+            input: 3.0,
+            output: 15.0,
+            cache_read: 0.3,
+            cache_write: 3.75,
+        };
         let cost = price.cost_for_tokens(1_000_000, 100_000, 500_000, 200_000);
         let expected = 3.0 + 1.5 + 0.15 + 0.75;
         assert!((cost - expected).abs() < 1e-9);

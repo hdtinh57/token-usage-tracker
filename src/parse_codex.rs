@@ -33,19 +33,37 @@ impl CodexSessionParser {
         }
         let model = self.current_model.clone()?;
         let ts_str = v.get("timestamp")?.as_str()?;
-        let ts: DateTime<Utc> = DateTime::parse_from_rfc3339(ts_str).ok()?.with_timezone(&Utc);
+        let ts: DateTime<Utc> = DateTime::parse_from_rfc3339(ts_str)
+            .ok()?
+            .with_timezone(&Utc);
         let last = payload.get("info")?.get("last_token_usage")?;
         let get_u64 = |field: &str| last.get(field).and_then(|x| x.as_u64()).unwrap_or(0);
 
+        let cache_read = get_u64("cached_input_tokens");
         Some(UsageEvent {
             ts,
             source: Source::Codex,
             model,
-            input: get_u64("input_tokens"),
+            // Codex's total_tokens proves cached input is already included in input_tokens.
+            // Store the non-cached portion so totals and pricing do not count it twice.
+            input: get_u64("input_tokens").saturating_sub(cache_read),
             output: get_u64("output_tokens"),
-            cache_read: get_u64("cached_input_tokens"),
+            cache_read,
             cache_write: 0,
+            reset_at: Self::soonest_reset(payload),
         })
+    }
+
+    /// Codex reports both a short session window and a longer weekly one
+    /// under `rate_limits.primary`/`.secondary`; surface whichever resets
+    /// first since that is the one that actually blocks the next request.
+    fn soonest_reset(payload: &Value) -> Option<DateTime<Utc>> {
+        let rate_limits = payload.get("rate_limits")?;
+        ["primary", "secondary"]
+            .iter()
+            .filter_map(|window| rate_limits.get(window)?.get("resets_at")?.as_i64())
+            .filter_map(|epoch| DateTime::from_timestamp(epoch, 0))
+            .min()
     }
 }
 
@@ -75,7 +93,7 @@ mod tests {
         p.process_line(TURN_CONTEXT);
         let ev = p.process_line(TOKEN_COUNT_1).expect("should parse");
         assert_eq!(ev.model, "gpt-5.5");
-        assert_eq!(ev.input, 100);
+        assert_eq!(ev.input, 90);
         assert_eq!(ev.output, 20);
         assert_eq!(ev.cache_read, 10);
         assert_eq!(ev.cache_write, 0);
@@ -94,9 +112,10 @@ mod tests {
         let sum_cache = ev1.cache_read + ev2.cache_read;
 
         // Final total_token_usage in TOKEN_COUNT_2's fixture: input=150, output=30, cached=15.
-        assert_eq!(sum_input, 150);
+        assert_eq!(sum_input, 135);
         assert_eq!(sum_output, 30);
         assert_eq!(sum_cache, 15);
+        assert_eq!(sum_input + sum_cache + sum_output, 180);
     }
 
     #[test]
