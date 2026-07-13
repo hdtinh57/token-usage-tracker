@@ -9,7 +9,7 @@ A background thread polls two local log roots:
 - `%USERPROFILE%\.claude\projects\**\*.jsonl` (Claude Code)
 - `%USERPROFILE%\.codex\sessions\**\*.jsonl` (Codex CLI)
 
-using a two-tier schedule — a fast tail of recently-active files (~2s) and a slower directory-discovery sweep (~20s) — and publishes a coalesced in-memory snapshot the UI reads once a second. Everything shown is scoped to **the current local calendar day** and resets at local midnight. Full design rationale (truncation handling, day-rollover semantics, repricing correctness) is in [`docs/superpowers/specs/2026-07-13-token-usage-tracker-design.md`](docs/superpowers/specs/2026-07-13-token-usage-tracker-design.md).
+using a two-tier schedule — a fast tail of recently-active files (~2s) and a slower directory-discovery sweep (~20s) — and publishes a coalesced in-memory snapshot the UI reads once a second. Everything shown is scoped to **the current local calendar day** and resets at local midnight. Full design rationale (truncation handling, day-rollover semantics, repricing correctness) lives in `docs/superpowers/specs/2026-07-13-token-usage-tracker-design.md` (not tracked in git).
 
 ## Running it
 
@@ -21,14 +21,23 @@ On first run, a `pricing.json` file is created next to the executable with defau
 
 ## UI
 
-- **Model** / **Source** dropdowns filter both the stat rows and the hourly chart.
-- Stat rows: Input / Output / Cache read / Cache write / Total tokens / Est. cost.
-- Line chart: tokens per hour-of-day, today only.
+![Token Usage Tracker screenshot](assets/screenshot.png)
+
+A fixed 360×450 window, top to bottom:
+
+- **Hero figure** — today's estimated cost, total tokens, and an in/out/cache breakdown, with a live/idle pulse indicator.
+- **Quota** — Claude session (5h) and weekly (7d) windows plus Codex's window, each with time-to-reset and a usage fill bar. Claude's numbers come straight from the account (see below); Codex's come from its own log.
+- **Activity** — a fixed-row scrolling feed of individual requests, newest first.
+- **Tokens / hour** — a 24-bar chart of today's usage by local hour, Claude and Codex stacked per bar.
+
+### Claude quota polling
+
+Claude's transcripts carry no rate-limit data, so `src/quota.rs` polls the same `api.anthropic.com/api/oauth/usage` endpoint Claude Code's own `/usage` screen reads, authenticated with the OAuth token Claude Code already stores at `%USERPROFILE%\.claude\.credentials.json`. Read-only, polled every 3 minutes, and a failed poll (offline, logged out) just keeps the last good reading instead of blanking the display.
 
 ## Development
 
 ```
-cargo test      # 42 unit tests across parsing, aggregation, tailing, and discovery
+cargo test      # 56 unit tests across parsing, aggregation, tailing, discovery, and quota
 cargo build --release
 ```
 
@@ -40,6 +49,7 @@ Project layout:
 | `src/pricing.rs` | Pricing table, longest-prefix model matching, hot-reloadable `pricing.json` |
 | `src/parse_claude.rs` | Claude Code jsonl line parser |
 | `src/parse_codex.rs` | Codex CLI jsonl parser (stateful: model from `turn_context`, tokens from `token_count`) |
+| `src/quota.rs` | Polls the account's real Claude 5h/7d quota windows over the Claude Code OAuth token |
 | `src/tail.rs` | Partial-line buffering + file offset tracking (truncation-safe) |
 | `src/discovery.rs` | Recursive log discovery, mtime-based active-file selection |
 | `src/worker.rs` | Background polling loop wiring the above together |
