@@ -21,7 +21,7 @@ On first run, a `pricing.json` file is created next to the executable with defau
 
 ## UI
 
-![Token Usage Tracker screenshot](assets/screenshot.png)
+![Token Usage Tracker screenshot](assets/screenshot-clean.png)
 
 A fixed 360×450 window, top to bottom:
 
