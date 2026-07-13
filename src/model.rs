@@ -207,7 +207,7 @@ pub fn ingest_event(stats: &mut Stats, ev: &UsageEvent, pricing: &PricingTable) 
     }
     let hour = local_ts.hour_index();
 
-    if unknown {
+    if unknown && [ev.input, ev.output, ev.cache_read, ev.cache_write] != [0; 4] {
         stats.unknown_pricing_models.insert(ev.model.clone());
     }
 
@@ -499,6 +499,17 @@ mod tests {
                 .unknown_pricing_models
                 .contains("some-brand-new-model")
         );
+    }
+
+    #[test]
+    fn zero_token_unknown_model_does_not_invalidate_pricing() {
+        let today = chrono::Local::now().date_naive();
+        let mut stats = Stats::new(today);
+        let ev = event_on(today, 10, Source::Claude, "<synthetic>", 0);
+
+        ingest_event(&mut stats, &ev, &table_with_sonnet());
+
+        assert!(stats.unknown_pricing_models.is_empty());
     }
 
     #[test]

@@ -149,7 +149,7 @@ impl App {
         ctx.set_theme(egui::Theme::Dark);
         ctx.set_visuals_of(egui::Theme::Dark, visuals);
         ctx.style_mut_of(egui::Theme::Dark, |style| {
-            style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+            style.spacing.item_spacing = egui::vec2(6.0, 1.0);
             style.spacing.scroll.bar_width = 4.0;
             style.spacing.scroll.floating = true;
         });
@@ -379,7 +379,8 @@ impl eframe::App for App {
                 // Stack the chart up from the bottom edge, then let everything
                 // else fill the slack above it. Splitting the two by hand meant
                 // subtracting a constant, and a wrong constant silently clipped
-                // the caption off the bottom of the window.
+                // the caption off the bottom of the window (or, the other
+                // direction, let the dashboard overflow into the chart).
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.horizontal(|ui| {
                         ui.label(label("TOKENS / HOUR", 9.0, MUTED));
@@ -480,12 +481,15 @@ impl App {
     }
 
     fn ledger(&mut self, ui: &mut egui::Ui, stats: &Stats) {
+        // The header may advance the view during this frame. Keep rendering
+        // the view that entered the ledger; Today renders on the next frame.
+        let view = self.view;
         self.view_header(ui, stats);
         let pricing = PricingTable::load(&self.pricing_path).ok();
         status_marker(ui, stats, pricing.is_none());
         divider(ui);
 
-        match self.view {
+        match view {
             View::Week => {
                 heading(ui, "LAST 7 DAYS");
                 for offset in (0..7).rev() {
@@ -614,9 +618,10 @@ fn live_indicator(ui: &mut egui::Ui, stats: &Stats) {
 const FEED_ROW: f32 = 22.0;
 
 fn activity_feed(ui: &mut egui::Ui, stats: &Stats, available: f32) {
-    let height = (available / FEED_ROW).floor() * FEED_ROW;
+    let height = activity_height(available);
     egui::ScrollArea::vertical()
         .max_height(height)
+        .min_scrolled_height(0.0)
         .auto_shrink([false, false])
         .show(ui, |ui| {
             // Rows must pitch at exactly FEED_ROW for the flooring above to
@@ -656,6 +661,10 @@ fn activity_feed(ui: &mut egui::Ui, stats: &Stats, available: f32) {
         });
 }
 
+fn activity_height(available: f32) -> f32 {
+    (available.max(0.0) / FEED_ROW).floor() * FEED_ROW
+}
+
 /// Vendor prefixes are redundant once the source rule is colored, and they
 /// push the model name into the token column on a 360px window.
 fn short_model(model: &str) -> &str {
@@ -680,6 +689,12 @@ mod tests {
     fn history_scroll_height_never_goes_negative() {
         assert_eq!(history_scroll_height(-1.0), 0.0);
         assert_eq!(history_scroll_height(120.0), 120.0);
+    }
+
+    #[test]
+    fn activity_height_reserves_the_chart_footer_without_slicing_a_row() {
+        assert_eq!(activity_height(-1.0), 0.0);
+        assert_eq!(activity_height(FEED_ROW * 2.0 + 1.0), FEED_ROW * 2.0);
     }
 
     #[test]
