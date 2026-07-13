@@ -1,12 +1,22 @@
 use chrono::Timelike;
 use eframe::egui::{self, Color32, Stroke};
-use std::sync::{Arc, Mutex};
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex, mpsc};
 
 use crate::model::{Source, Stats, hourly_totals_for, totals_for};
+use crate::settings::Settings;
+use crate::tray::{Command as TrayCommand, Tray};
 
 pub struct App {
     snapshot: Arc<Mutex<Arc<Stats>>>,
+    settings: Settings,
+    settings_path: PathBuf,
+    pricing_path: PathBuf,
+    tray_events: mpsc::Receiver<TrayCommand>,
+    _tray: Tray,
     styled: bool,
+    window_visible: bool,
+    quitting: bool,
 }
 
 // Only two hues carry meaning: which tool produced the usage. Everything else
@@ -28,11 +38,63 @@ const MARGIN: i8 = 12;
 const CHART_HEIGHT: f32 = 40.0;
 
 impl App {
-    pub fn new(snapshot: Arc<Mutex<Arc<Stats>>>) -> Self {
+    pub fn new(
+        snapshot: Arc<Mutex<Arc<Stats>>>,
+        settings: Settings,
+        settings_path: PathBuf,
+        pricing_path: PathBuf,
+        tray_events: mpsc::Receiver<TrayCommand>,
+        tray: Tray,
+    ) -> Self {
         App {
             snapshot,
+            settings,
+            settings_path,
+            pricing_path,
+            tray_events,
+            _tray: tray,
             styled: false,
+            window_visible: true,
+            quitting: false,
         }
+    }
+
+    fn handle_tray_events(&mut self, ctx: &egui::Context) {
+        while let Ok(command) = self.tray_events.try_recv() {
+            match command {
+                TrayCommand::ToggleWindow => {
+                    self.window_visible = !self.window_visible;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(self.window_visible));
+                }
+                TrayCommand::ToggleCloseToTray => {
+                    self.settings.close_to_tray = !self.settings.close_to_tray;
+                    self.save_settings();
+                }
+                TrayCommand::ToggleNotifications => {
+                    self.settings.notifications_enabled = !self.settings.notifications_enabled;
+                    self.save_settings();
+                }
+                TrayCommand::OpenPricing => {
+                    if let Err(error) = std::process::Command::new("explorer")
+                        .arg(&self.pricing_path)
+                        .spawn()
+                    {
+                        eprintln!("warning: failed opening pricing.json: {error}");
+                    }
+                }
+                TrayCommand::Quit => {
+                    self.quitting = true;
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
+            }
+        }
+    }
+
+    fn save_settings(&self) {
+        if let Err(error) = self.settings.save(&self.settings_path) {
+            eprintln!("warning: failed saving settings: {error}");
+        }
+        self._tray.sync_settings(self.settings);
     }
 
     fn source_color(source: Source) -> Color32 {
@@ -263,6 +325,17 @@ fn hourly_chart(ui: &mut egui::Ui, stats: &Stats, height: f32) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.style(ui.ctx());
+        self.handle_tray_events(ui.ctx());
+        if self.settings.close_to_tray
+            && !self.quitting
+            && ui.ctx().input(|input| input.viewport().close_requested())
+        {
+            self.window_visible = false;
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ui.ctx()
+                .send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_secs(1));
         let stats = self.snapshot.lock().unwrap().clone();

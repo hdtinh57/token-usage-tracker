@@ -29,6 +29,7 @@ pub struct Worker {
     pricing_path: PathBuf,
     history_path: PathBuf,
     alerts_path: PathBuf,
+    settings_path: PathBuf,
     settings: Settings,
     alerts: AlertState,
     watcher: RecommendedWatcher,
@@ -62,6 +63,7 @@ impl Worker {
             )
         })?;
         let settings = Settings::load(&app_data.join("settings.json"))?;
+        let settings_path = app_data.join("settings.json");
         let alerts_path = app_data.join("alerts.json");
         let alerts = AlertState::load(&alerts_path)?;
         let pricing_mtime = std::fs::metadata(&pricing_path)
@@ -83,6 +85,7 @@ impl Worker {
             pricing_path,
             history_path: history_path.clone(),
             alerts_path,
+            settings_path,
             settings,
             alerts,
             watcher,
@@ -310,18 +313,23 @@ impl Worker {
         utilization: Option<f64>,
         reset_at: Option<chrono::DateTime<chrono::Utc>>,
     ) {
+        if let Ok(settings) = Settings::load(&self.settings_path) {
+            self.settings = settings;
+        }
         if !self.settings.notifications_enabled {
             return;
         }
         let (Some(utilization), Some(reset_at)) = (utilization, reset_at) else {
             return;
         };
-        let previous = self.alerts.clone();
-        self.alerts.crossed(source, window, utilization, reset_at);
-        if self.alerts != previous
+        let crossed = self.alerts.crossed(source, window, utilization, reset_at);
+        if !crossed.is_empty()
             && let Err(error) = self.alerts.save(&self.alerts_path)
         {
             eprintln!("warning: failed saving quota alert state: {error}");
+        }
+        for threshold in crossed {
+            notify_quota(source, window, threshold);
         }
     }
 
@@ -356,6 +364,20 @@ impl Worker {
         }
     }
 }
+
+#[cfg(windows)]
+fn notify_quota(source: Source, window: &str, threshold: u8) {
+    if let Err(error) = notify_rust::Notification::new()
+        .summary("Token Usage Tracker")
+        .body(&format!("{source:?} {window} quota reached {threshold}%"))
+        .show()
+    {
+        eprintln!("warning: failed showing quota notification: {error}");
+    }
+}
+
+#[cfg(not(windows))]
+fn notify_quota(_source: Source, _window: &str, _threshold: u8) {}
 
 #[cfg(test)]
 mod tests {
