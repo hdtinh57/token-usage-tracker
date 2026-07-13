@@ -2,12 +2,15 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use chrono::NaiveDate;
 
+use crate::history::{History, RawTotals};
 use crate::pricing::PricingTable;
 use crate::quota::ClaudeQuota;
 
 pub const FEED_CAPACITY: usize = 20;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum Source {
     Claude,
     Codex,
@@ -78,6 +81,7 @@ pub struct FeedEntry {
 #[derive(Debug, Clone)]
 pub struct Stats {
     pub current_day: NaiveDate,
+    pub history: History,
     pub by_model: HashMap<(Source, String), Totals>,
     pub by_hour: HashMap<(Source, String), [Totals; 24]>,
     pub unknown_pricing_models: HashSet<String>,
@@ -100,6 +104,7 @@ impl Stats {
     pub fn new(today: NaiveDate) -> Self {
         Stats {
             current_day: today,
+            history: History::default(),
             by_model: HashMap::new(),
             by_hour: HashMap::new(),
             unknown_pricing_models: HashSet::new(),
@@ -259,6 +264,48 @@ pub fn hourly_totals_for(
         }
     }
     acc
+}
+
+pub fn history_totals_for(
+    stats: &Stats,
+    start: NaiveDate,
+    end: NaiveDate,
+    model: Option<&str>,
+    source: Option<Source>,
+) -> RawTotals {
+    stats.history.totals_in(start..=end, model, source)
+}
+
+pub fn weekly_totals_for(
+    stats: &Stats,
+    pricing: &PricingTable,
+    model: Option<&str>,
+    source: Option<Source>,
+) -> Totals {
+    let mut totals = stats
+        .history
+        .current_week_totals(stats.current_day, pricing, model, source);
+    for ((entry_source, entry_model), current) in &stats.by_model {
+        if model.is_some_and(|filter| entry_model != filter)
+            || source.is_some_and(|filter| *entry_source != filter)
+        {
+            continue;
+        }
+        totals.input += current.input;
+        totals.output += current.output;
+        totals.cache_read += current.cache_read;
+        totals.cache_write += current.cache_write;
+        totals.requests += current.requests;
+        if let Some(price) = pricing.lookup(entry_model) {
+            totals.cost += price.cost_for_tokens(
+                current.input,
+                current.output,
+                current.cache_read,
+                current.cache_write,
+            );
+        }
+    }
+    totals
 }
 
 trait HourIndex {
@@ -514,6 +561,58 @@ mod tests {
 
         assert!((totals_for(&stats, None, None).cost - 2.0).abs() < 1e-9);
         assert!((hourly_totals_for(&stats, None, None)[5].cost - 2.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn weekly_totals_use_raw_history_with_current_pricing() {
+        let today = NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        let mut stats = Stats::new(today);
+        stats.history.add(
+            today - chrono::Duration::days(6),
+            Source::Claude,
+            "claude-sonnet-4-6",
+            crate::history::RawTotals {
+                input: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        stats.history.add(
+            today - chrono::Duration::days(7),
+            Source::Claude,
+            "claude-sonnet-4-6",
+            crate::history::RawTotals {
+                input: 9_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        stats.by_model.insert(
+            (Source::Claude, "claude-sonnet-4-6".to_string()),
+            Totals {
+                input: 1_000_000,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        let mut pricing = HashMap::new();
+        pricing.insert(
+            "claude-sonnet-4".to_string(),
+            Price {
+                input: 2.0,
+                output: 0.0,
+                cache_read: 0.0,
+                cache_write: 0.0,
+            },
+        );
+        let totals = weekly_totals_for(&stats, &PricingTable::from_map(pricing), None, None);
+        assert_eq!(
+            history_totals_for(&stats, today - chrono::Duration::days(6), today, None, None).input,
+            1_000_000
+        );
+        assert_eq!(totals.input, 2_000_000);
+        assert_eq!(totals.requests, 2);
+        assert_eq!(totals.cost, 4.0);
     }
 
     #[test]

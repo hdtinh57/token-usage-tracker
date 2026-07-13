@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime};
 use chrono::Local;
 
 use crate::discovery::{collect_mtimes, select_active, walk_jsonl_files};
+use crate::history::RawTotals;
 use crate::model::{Stats, ingest_event, reprice};
 use crate::parse_claude::ClaudeSessionParser;
 use crate::parse_codex::CodexSessionParser;
@@ -22,6 +23,7 @@ pub struct Worker {
     claude_root: PathBuf,
     codex_root: PathBuf,
     pricing_path: PathBuf,
+    history_path: PathBuf,
     tailer: Tailer,
     claude_parsers: HashMap<PathBuf, ClaudeSessionParser>,
     codex_parsers: HashMap<PathBuf, CodexSessionParser>,
@@ -29,6 +31,7 @@ pub struct Worker {
     pricing: PricingTable,
     pricing_mtime: Option<SystemTime>,
     stats: Stats,
+    startup_history: HashMap<chrono::NaiveDate, HashMap<(crate::model::Source, String), RawTotals>>,
     last_quota_poll: Option<std::time::Instant>,
     snapshot: Arc<Mutex<Arc<Stats>>>,
 }
@@ -38,23 +41,28 @@ impl Worker {
         claude_root: PathBuf,
         codex_root: PathBuf,
         pricing_path: PathBuf,
+        history_path: PathBuf,
         snapshot: Arc<Mutex<Arc<Stats>>>,
     ) -> std::io::Result<Self> {
         let pricing = PricingTable::load(&pricing_path)?;
         let pricing_mtime = std::fs::metadata(&pricing_path)
             .and_then(|m| m.modified())
             .ok();
+        let mut stats = Stats::new(Local::now().date_naive());
+        stats.history = crate::history::History::load(&history_path)?;
         Ok(Self {
             claude_root,
             codex_root,
             pricing_path,
+            history_path: history_path.clone(),
             tailer: Tailer::new(),
             claude_parsers: HashMap::new(),
             codex_parsers: HashMap::new(),
             active_set: Vec::new(),
             pricing,
             pricing_mtime,
-            stats: Stats::new(Local::now().date_naive()),
+            stats,
+            startup_history: HashMap::new(),
             last_quota_poll: None,
             snapshot,
         })
@@ -83,6 +91,18 @@ impl Worker {
         for path in recent {
             self.ingest_whole_file(&path);
         }
+        if !self.startup_history.is_empty() {
+            let mut recovered = false;
+            for (day, entries) in std::mem::take(&mut self.startup_history) {
+                if !self.stats.history.contains_day(day) {
+                    self.stats.history.replace_day(day, entries.into_iter());
+                    recovered = true;
+                }
+            }
+            if recovered && let Err(error) = self.stats.history.save(&self.history_path) {
+                eprintln!("warning: failed saving recovered usage history: {error}");
+            }
+        }
         self.refresh_active_set(ACTIVE_WINDOW);
     }
 
@@ -92,12 +112,12 @@ impl Worker {
         };
         let is_codex = path.starts_with(&self.codex_root);
         for line in String::from_utf8_lossy(&bytes).lines() {
-            self.ingest_line(path, line, is_codex);
+            self.ingest_line(path, line, is_codex, true);
         }
         self.tailer.prime(path, bytes.len() as u64);
     }
 
-    fn ingest_line(&mut self, path: &Path, line: &str, is_codex: bool) {
+    fn ingest_line(&mut self, path: &Path, line: &str, is_codex: bool, today_only: bool) {
         let event = if is_codex {
             self.codex_parsers
                 .entry(path.to_path_buf())
@@ -110,24 +130,59 @@ impl Worker {
                 .process_line(line)
         };
         if let Some(event) = event {
-            ingest_event(&mut self.stats, &event, &self.pricing);
+            let day = event.ts.with_timezone(&Local).date_naive();
+            if today_only && day < self.stats.current_day {
+                self.startup_history
+                    .entry(day)
+                    .or_default()
+                    .entry((event.source, event.model.clone()))
+                    .or_default()
+                    .merge(&RawTotals {
+                        input: event.input,
+                        output: event.output,
+                        cache_read: event.cache_read,
+                        cache_write: event.cache_write,
+                        requests: 1,
+                    });
+            } else if !today_only || day == self.stats.current_day {
+                ingest_event(&mut self.stats, &event, &self.pricing);
+            }
         }
     }
 
     pub fn fast_tick(&mut self) {
-        self.stats.rollover_if_needed(Local::now().date_naive());
+        self.persist_completed_day_if_needed();
         for path in self.active_set.clone() {
             let is_codex = path.starts_with(&self.codex_root);
             match self.tailer.poll(&path) {
                 Ok(lines) => {
                     for line in lines {
-                        self.ingest_line(&path, &line, is_codex);
+                        self.ingest_line(&path, &line, is_codex, false);
                     }
                 }
                 Err(error) => eprintln!("warning: failed reading {}: {error}", path.display()),
             }
         }
         self.publish();
+    }
+
+    fn persist_completed_day_if_needed(&mut self) {
+        let today = Local::now().date_naive();
+        if self.stats.current_day == today {
+            return;
+        }
+        self.stats.history.replace_day(
+            self.stats.current_day,
+            self.stats
+                .by_model
+                .iter()
+                .map(|(key, totals)| (key.clone(), RawTotals::from_totals(totals))),
+        );
+        if let Err(error) = self.stats.history.save(&self.history_path) {
+            eprintln!("warning: failed saving usage history: {error}");
+            return;
+        }
+        self.stats.rollover_if_needed(today);
     }
 
     pub fn slow_tick(&mut self) {
@@ -211,9 +266,12 @@ mod tests {
     }
 
     fn today_ts(hour: u32) -> String {
-        let today = chrono::Local::now().date_naive();
+        date_ts(chrono::Local::now().date_naive(), hour)
+    }
+
+    fn date_ts(date: chrono::NaiveDate, hour: u32) -> String {
         chrono::Local
-            .from_local_datetime(&today.and_hms_opt(hour, 0, 0).unwrap())
+            .from_local_datetime(&date.and_hms_opt(hour, 0, 0).unwrap())
             .unwrap()
             .with_timezone(&chrono::Utc)
             .to_rfc3339()
@@ -223,9 +281,9 @@ mod tests {
     fn startup_rescan_ingests_todays_events_from_both_roots() {
         let claude_root = temp_root("claude");
         let codex_root = temp_root("codex");
-        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir"))
-            .unwrap()
-            .pricing;
+        let paths = crate::paths::Paths::from_app_data(temp_root("pricing_dir")).unwrap();
+        let pricing_path = paths.pricing;
+        let history_path = paths.history;
         let claude_line = format!(
             r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#,
             today_ts(9)
@@ -248,6 +306,7 @@ mod tests {
             claude_root.clone(),
             codex_root.clone(),
             pricing_path,
+            history_path,
             snapshot.clone(),
         )
         .unwrap();
@@ -262,12 +321,111 @@ mod tests {
     }
 
     #[test]
+    fn startup_recovers_yesterdays_usage_to_history_without_adding_it_to_today() {
+        let claude_root = temp_root("recover_claude");
+        let codex_root = temp_root("recover_codex");
+        let paths = crate::paths::Paths::from_app_data(temp_root("recover_history")).unwrap();
+        let yesterday = chrono::Local::now().date_naive().pred_opt().unwrap();
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":100,"output_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#,
+            date_ts(yesterday, 9)
+        );
+        std::fs::write(claude_root.join("session.jsonl"), format!("{line}\n")).unwrap();
+        let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
+            chrono::Local::now().date_naive(),
+        ))));
+        let mut worker = Worker::new(
+            claude_root.clone(),
+            codex_root.clone(),
+            paths.pricing,
+            paths.history.clone(),
+            snapshot,
+        )
+        .unwrap();
+
+        worker.startup();
+
+        assert!(worker.stats.by_model.is_empty());
+        assert_eq!(
+            crate::history::History::load(&paths.history)
+                .unwrap()
+                .totals_for(yesterday, None, None)
+                .input,
+            100
+        );
+        let _ = std::fs::remove_dir_all(claude_root);
+        let _ = std::fs::remove_dir_all(codex_root);
+    }
+
+    #[test]
+    fn startup_recovery_keeps_existing_day_when_only_one_session_is_recent() {
+        let claude_root = temp_root("partial_claude");
+        let codex_root = temp_root("partial_codex");
+        let paths = crate::paths::Paths::from_app_data(temp_root("partial_history")).unwrap();
+        let yesterday = chrono::Local::now().date_naive().pred_opt().unwrap();
+        let mut existing = crate::history::History::default();
+        existing.add(
+            yesterday,
+            crate::model::Source::Claude,
+            "claude-sonnet-4-6",
+            RawTotals {
+                input: 10,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        existing.add(
+            yesterday,
+            crate::model::Source::Codex,
+            "gpt-5.5",
+            RawTotals {
+                input: 20,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+        existing.save(&paths.history).unwrap();
+        let line = format!(
+            r#"{{"type":"assistant","timestamp":"{}","message":{{"model":"claude-sonnet-4-6","usage":{{"input_tokens":10,"output_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0}}}}}}"#,
+            date_ts(yesterday, 9)
+        );
+        std::fs::write(
+            claude_root.join("recent-session.jsonl"),
+            format!("{line}\n"),
+        )
+        .unwrap();
+        let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
+            chrono::Local::now().date_naive(),
+        ))));
+        let mut worker = Worker::new(
+            claude_root.clone(),
+            codex_root.clone(),
+            paths.pricing,
+            paths.history.clone(),
+            snapshot,
+        )
+        .unwrap();
+
+        worker.startup();
+
+        assert_eq!(
+            crate::history::History::load(&paths.history)
+                .unwrap()
+                .totals_for(yesterday, None, None)
+                .input,
+            30
+        );
+        let _ = std::fs::remove_dir_all(claude_root);
+        let _ = std::fs::remove_dir_all(codex_root);
+    }
+
+    #[test]
     fn fast_tick_picks_up_appended_lines_after_startup() {
         let claude_root = temp_root("claude2");
         let codex_root = temp_root("codex2");
-        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir2"))
-            .unwrap()
-            .pricing;
+        let paths = crate::paths::Paths::from_app_data(temp_root("pricing_dir2")).unwrap();
+        let pricing_path = paths.pricing;
+        let history_path = paths.history;
         std::fs::write(claude_root.join("session1.jsonl"), b"").unwrap();
         let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
             chrono::Local::now().date_naive(),
@@ -276,6 +434,7 @@ mod tests {
             claude_root.clone(),
             codex_root.clone(),
             pricing_path,
+            history_path,
             snapshot.clone(),
         )
         .unwrap();
@@ -301,12 +460,59 @@ mod tests {
     }
 
     #[test]
+    fn rollover_saves_completed_day_before_clearing_live_totals() {
+        let claude_root = temp_root("rollover_claude");
+        let codex_root = temp_root("rollover_codex");
+        let paths = crate::paths::Paths::from_app_data(temp_root("rollover_history")).unwrap();
+        let history_path = paths.history;
+        let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
+            chrono::Local::now().date_naive(),
+        ))));
+        let mut worker = Worker::new(
+            claude_root.clone(),
+            codex_root.clone(),
+            paths.pricing,
+            history_path.clone(),
+            snapshot,
+        )
+        .unwrap();
+        let yesterday = chrono::Local::now().date_naive().pred_opt().unwrap();
+        worker.stats.current_day = yesterday;
+        worker.stats.by_model.insert(
+            (
+                crate::model::Source::Claude,
+                "claude-sonnet-4-6".to_string(),
+            ),
+            crate::model::Totals {
+                input: 42,
+                requests: 1,
+                ..Default::default()
+            },
+        );
+
+        worker.persist_completed_day_if_needed();
+
+        assert_eq!(worker.stats.current_day, chrono::Local::now().date_naive());
+        assert!(worker.stats.by_model.is_empty());
+        assert_eq!(
+            crate::history::History::load(&history_path)
+                .unwrap()
+                .totals_for(yesterday, None, None)
+                .input,
+            42
+        );
+
+        let _ = std::fs::remove_dir_all(claude_root);
+        let _ = std::fs::remove_dir_all(codex_root);
+    }
+
+    #[test]
     fn slow_tick_discovers_a_brand_new_file_created_after_startup() {
         let claude_root = temp_root("claude3");
         let codex_root = temp_root("codex3");
-        let pricing_path = crate::paths::Paths::from_app_data(temp_root("pricing_dir3"))
-            .unwrap()
-            .pricing;
+        let paths = crate::paths::Paths::from_app_data(temp_root("pricing_dir3")).unwrap();
+        let pricing_path = paths.pricing;
+        let history_path = paths.history;
         let snapshot = Arc::new(Mutex::new(Arc::new(crate::model::Stats::new(
             chrono::Local::now().date_naive(),
         ))));
@@ -314,6 +520,7 @@ mod tests {
             claude_root.clone(),
             codex_root.clone(),
             pricing_path,
+            history_path,
             snapshot.clone(),
         )
         .unwrap();
@@ -337,9 +544,9 @@ mod tests {
     fn malformed_pricing_keeps_the_last_good_table_and_retries_after_correction() {
         let claude_root = temp_root("reload_claude");
         let codex_root = temp_root("reload_codex");
-        let pricing_path = crate::paths::Paths::from_app_data(temp_root("reload_pricing"))
-            .unwrap()
-            .pricing;
+        let paths = crate::paths::Paths::from_app_data(temp_root("reload_pricing")).unwrap();
+        let pricing_path = paths.pricing;
+        let history_path = paths.history;
         std::fs::write(
             &pricing_path,
             r#"{ "model": { "input": 1.0, "output": 1.0, "cache_read": 1.0, "cache_write": 1.0 } }"#,
@@ -352,6 +559,7 @@ mod tests {
             claude_root.clone(),
             codex_root.clone(),
             pricing_path.clone(),
+            history_path,
             snapshot,
         )
         .unwrap();

@@ -1,4 +1,5 @@
 mod discovery;
+mod history;
 mod model;
 mod parse_claude;
 mod parse_codex;
@@ -21,8 +22,14 @@ fn main() -> eframe::Result<()> {
     let today = chrono::Local::now().date_naive();
     let snapshot = Arc::new(Mutex::new(Arc::new(model::Stats::new(today))));
 
-    let worker = worker::Worker::new(claude_root, codex_root, paths.pricing, snapshot.clone())
-        .expect("failed to initialize worker (check pricing.json permissions)");
+    let worker = worker::Worker::new(
+        claude_root,
+        codex_root,
+        paths.pricing,
+        paths.history,
+        snapshot.clone(),
+    )
+    .expect("failed to initialize worker (check pricing.json permissions)");
     std::thread::spawn(move || worker.run());
 
     let options = eframe::NativeOptions {
